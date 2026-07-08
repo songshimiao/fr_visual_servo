@@ -1,0 +1,6 @@
+.vscode
+resources/intrinsics_img
+scripts/algorithm/__pycache__
+scripts/robot/__pycache__
+scripts/robot/fairino
+scripts/robot/libfairino
