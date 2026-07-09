@@ -72,6 +72,23 @@ def pose_error_magnitudes(T_a: SE3, T_b: SE3) -> Tuple[float, float]:
     return position_error, rotation_error
 
 
+def _rotation_angle_fast(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """
+    计算两个旋转矩阵之间的夹角(rad), 用迹公式直接算, 不做 SVD 正交化修正。
+
+    与 pose_error_magnitudes 的区别: 这里假设输入本身已经是(或接近)合法的
+    旋转矩阵(比如来自 FK/滤波后的 SE3, 而不是未经处理的原始相机噪声), 因此
+    跳过 SVD 步骤以换取速度。SVD 分解不便宜, 在需要对一个较大窗口(几十~上百
+    个样本)逐一计算偏差的场景(如 MarkerStillnessDetector 每个 tick 都要扫一遍
+    整个窗口)如果每对样本都做一次 SVD, 会显著拖慢控制循环周期(实测: settle_time=3s
+    时导致循环周期从 ~14ms 涨到 ~23ms, 超出 ServoJ 要求的 1-16ms 区间), 这类内部
+    场景改用该函数可以避免这个开销。
+    """
+    cos_theta = (np.trace(Ra.T @ Rb) - 1.0) / 2.0
+    cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+    return float(np.arccos(cos_theta))
+
+
 def interp_pose(current: SE3, target: SE3, s_position: float, s_orientation: float) -> SE3:
     """
     在 current 与 target 之间插值: 平移线性插值, 旋转用 SO3.interp (球面插值)。
@@ -472,10 +489,12 @@ class MarkerStillnessDetector:
             np.sqrt(np.mean(np.sum((translations - mean_t) ** 2, axis=1))))
 
         # 姿态: 相对"窗口中位样本"的角度标准差(用中位样本而非最新样本做基准,
-        # 避免基准本身恰好是一个离群噪声点)
+        # 避免基准本身恰好是一个离群噪声点)。用 _rotation_angle_fast 而不是
+        # pose_error_magnitudes, 避免窗口内每个样本都做一次 SVD 正交化。
         T_ref = window_samples[len(window_samples) // 2][1]
+        R_ref = T_ref.R
         ang_devs_deg = np.array(
-            [np.degrees(pose_error_magnitudes(T_ref, T)[1]) for _, T in window_samples])
+            [np.degrees(_rotation_angle_fast(R_ref, T.R)) for _, T in window_samples])
         ang_std_deg = float(np.std(ang_devs_deg))
 
         self.last_pos_std_m = pos_std

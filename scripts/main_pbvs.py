@@ -14,6 +14,14 @@ scripts/main_pbvs.py
     3. 静止检测: 当 marker 连续静止超过 --settle-time (默认 3s) 后, 自动把悬停
        距离从"远"切换到"近", 完成"靠近(抓取动作的占位, 当前无夹爪)"。
        若之后 marker 重新开始运动, 会自动判定为不再静止, 退回"远距离跟随"状态。
+    4. [可选] --blind-final-approach: "look-then-move" 盲逼近。标定板静止判定
+       触发的瞬间, 冻结当前 base_T_marker 估计, 用 flange_T_ref(camera 或
+       T_FLANGE_TO_TOOL1) 一次性算出固定的目标 flange 位姿, 然后彻底退出视觉
+       反馈(不再读取/依赖任何新的 marker 检测), 纯靠运动学(FK+IK)伺服到这个
+       固定目标 —— 解决 eye-in-hand 在近距离(尤其 --mode tool1)时 marker 会
+       超出相机视野导致伺服卡死的问题, 不需要额外加装 eye-to-hand 相机。
+       代价: 一旦冻结, 后续完全没有视觉反馈, 如果标定板在冻结后被移动, 不会
+       被感知到(这是"盲"逼近的本质权衡)。
 
 ⚠️ 关于实机抖动的两个关键修复(相对早期版本):
     1. PnP 姿态多解消歧: cv2.solvePnP(IPPE_SQUARE) 对平面正方形 marker 天生存在
@@ -218,6 +226,10 @@ def main():
                         help="从'靠近'状态退回'跟随'所需的姿态变化(度), 默认=settle-ang-thresh的4倍")
     parser.add_argument("--min-dwell-time", type=float, default=1.0,
                         help="状态切换后至少保持的时间(秒), 防止在阈值附近反复横跳, 默认1.0s")
+    parser.add_argument("--blind-final-approach", action="store_true",
+                        help="启用'look-then-move'盲逼近: marker静止判定触发的瞬间冻结目标位姿,"
+                        "退出视觉反馈, 纯运动学盲走到hover-near位置。用于解决--mode tool1"
+                        "近距离时marker超出相机视野导致伺服卡死的问题")
     parser.add_argument("--marker-length", type=float, default=0.05)
     parser.add_argument("--marker-id", type=int, default=None,
                         help="指定要跟踪的marker ID, 默认取视野中第一个")
@@ -376,40 +388,67 @@ def main():
     dt = 1.0 / args.servo_hz
     q_seed = get_q_rad()
 
+    # blind_target_flange: 一旦被设置为非None, 说明已进入"look-then-move"盲逼近
+    # 阶段, 之后不再读取任何marker观测, 只朝这个冻结的固定目标做纯运动学伺服。
+    blind_target_flange = None
+    blind_done_announced = False
+    prev_hover_state = HoverStateMachine.TRACKING
+
     print("[控制线程] 开始主循环, Ctrl+C 或预览窗口按 'q' 可停止")
     try:
         while not stop_event.is_set():
             loop_t0 = time.monotonic()
 
-            cam_T_marker_raw, marker_t, marker_found = shared_state.read()
-            if not marker_found or cam_T_marker_raw is None or (time.monotonic() - marker_t) > args.marker_timeout:
-                control_status["state"] = "marker lost-pause"
-                time.sleep(dt)
-                continue
+            if args.blind_final_approach and blind_target_flange is not None:
+                # ---- 盲逼近路径: 完全不读取marker, 纯运动学伺服到冻结目标 ----
+                q_current = get_q_rad()
+                base_T_flange_current = kinematics_model.forward_kinematics(q_current)
+                base_T_flange_desired = blind_target_flange
+                control_status["state"] = "blind-approach"
+                control_status["hover"] = args.hover_near
+            else:
+                # ---- 正常视觉伺服路径 ----
+                cam_T_marker_raw, marker_t, marker_found = shared_state.read()
+                if not marker_found or cam_T_marker_raw is None or (time.monotonic() - marker_t) > args.marker_timeout:
+                    control_status["state"] = "marker lost-pause"
+                    time.sleep(dt)
+                    continue
 
-            q_current = get_q_rad()
-            base_T_flange_current = kinematics_model.forward_kinematics(
-                q_current)
-            base_T_cam_current = base_T_flange_current * flange_T_cam
-            base_T_marker_raw = base_T_cam_current * cam_T_marker_raw
-            base_T_marker = marker_filter.update(base_T_marker_raw)
+                q_current = get_q_rad()
+                base_T_flange_current = kinematics_model.forward_kinematics(
+                    q_current)
+                base_T_cam_current = base_T_flange_current * flange_T_cam
+                base_T_marker_raw = base_T_cam_current * cam_T_marker_raw
+                base_T_marker = marker_filter.update(base_T_marker_raw)
 
-            is_still = stillness_detector.update(
-                time.monotonic(), base_T_marker)
-            control_status["still_span"] = stillness_detector.buffer_span_s
-            control_status["pos_std_mm"] = stillness_detector.last_pos_std_m * 1000.0
-            control_status["ang_std_deg"] = stillness_detector.last_ang_std_deg
+                is_still = stillness_detector.update(
+                    time.monotonic(), base_T_marker)
+                control_status["still_span"] = stillness_detector.buffer_span_s
+                control_status["pos_std_mm"] = stillness_detector.last_pos_std_m * 1000.0
+                control_status["ang_std_deg"] = stillness_detector.last_ang_std_deg
 
-            state = hover_state_machine.update(
-                time.monotonic(), is_still, base_T_marker)
-            approaching = state == HoverStateMachine.APPROACHING
-            hover_distance = args.hover_near if approaching else args.hover_far
-            control_status["state"] = "close" if approaching else "servoing"
-            control_status["hover"] = hover_distance
+                state = hover_state_machine.update(
+                    time.monotonic(), is_still, base_T_marker)
+                approaching = state == HoverStateMachine.APPROACHING
+                hover_distance = args.hover_near if approaching else args.hover_far
+                control_status["state"] = "close" if approaching else "servoing"
+                control_status["hover"] = hover_distance
 
-            base_T_flange_desired = compute_hover_flange_pose(
-                base_T_marker, flange_T_ref, hover_distance, z_align=True,
-            )
+                if (args.blind_final_approach and
+                        prev_hover_state != HoverStateMachine.APPROACHING and
+                        state == HoverStateMachine.APPROACHING):
+                    # 刚从TRACKING进入APPROACHING的这一帧: 冻结目标位姿, 之后切换到
+                    # 盲逼近路径, 不再依赖marker(解决近距离marker超出FOV的问题)。
+                    blind_target_flange = compute_hover_flange_pose(
+                        base_T_marker, flange_T_ref, args.hover_near, z_align=True,
+                    )
+                    print("\n[盲逼近] marker已静止, 冻结目标位姿并退出视觉反馈, "
+                          "开始纯运动学盲逼近 (--blind-final-approach)")
+                prev_hover_state = state
+
+                base_T_flange_desired = compute_hover_flange_pose(
+                    base_T_marker, flange_T_ref, hover_distance, z_align=True,
+                )
 
             q_next, T_next, status, pos_err, rot_err = controller.compute_next_joint_target(
                 base_T_flange_current, base_T_flange_desired, q_seed=q_current,
@@ -431,13 +470,17 @@ def main():
             ang_err_deg = np.rad2deg(rot_err)
             converged = status == controller.law.RESULT_FINISHED
 
+            if converged and blind_target_flange is not None and not blind_done_announced:
+                print("\n[盲逼近] 已到达冻结目标位姿, 盲逼近完成")
+                blind_done_announced = True
+
             if args.execute:
                 target_deg = list(np.rad2deg(q_next))
-                _try_servo_j(rpc_robot, target_deg, vel_percent=10.0)
+                _try_servo_j(rpc_robot, target_deg, vel_percent=2.0)
             else:
-                print(f"\r[dry-run] state={control_status['state']:>10s} "
+                print(f"\r[dry-run] state={control_status['state']:>14s} "
                       f"{'[已到位]' if converged else '[跟随中]'} "
-                      f"hover={hover_distance*1000:5.1f}mm "
+                      f"hover={control_status['hover']*1000:5.1f}mm "
                       f"pos_err={pos_err_mm:6.2f}mm ang_err={ang_err_deg:5.2f}deg "
                       f"noise(pos_std={control_status['pos_std_mm']:.1f}mm,"
                       f"ang_std={control_status['ang_std_deg']:.2f}deg) "
@@ -445,6 +488,7 @@ def main():
 
             elapsed = time.monotonic() - loop_t0
             time.sleep(max(0.0, dt - elapsed))
+
 
             if timing_monitor is not None:
                 report = timing_monitor.tick()
