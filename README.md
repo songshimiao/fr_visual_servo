@@ -10,6 +10,8 @@
 - 支持"远距离跟随"和"近距离靠近"两种悬停模式
 - 具备静止检测功能，当标记板静止时自动切换到靠近模式
 - 提供完整的安全机制和参数调节选项
+- 新增"look-then-move"盲逼近功能，解决近距离视觉伺服问题
+- **新增PnP多解消除功能，解决相机正对时的视觉伺服抖动问题** ([详情](readme/2026-07-09_1_pnp_multisolution_elimination.md))
 
 ## 项目结构
 
@@ -42,12 +44,11 @@ fr_visual_servo/
 - 工作空间限制保护
 - 低通滤波平滑处理
 - 状态机管理（远近悬停切换）
+- 性能优化：减少SVD计算开销，提升控制循环效率
 
-### 3. 安全特性
-- Dry-run 模式测试
-- 实时安全检查
-- 急停保护机制
-- 运行时参数验证
+### 3. 特殊功能
+- **盲逼近模式**：新增 `--blind-final-approach` 参数，实现"look-then-move"策略，解决近距离时marker超出视野的问题
+- **PnP多解消除**：解决相机正对marker时的解跳变问题，提升视觉伺服稳定性
 
 ## 使用方法
 
@@ -76,6 +77,7 @@ python scripts/main_pbvs.py --intrinsics resources/calibration/camera_intrinsics
 | `--servo-hz` | 100.0 | 控制频率（Hz） |
 | `--hover-far` | 0.15 | 远距离悬停高度（米） |
 | `--hover-near` | 0.05 | 近距离悬停高度（米） |
+| `--blind-final-approach` | - | 启用"look-then-move"盲逼近模式，解决近距离视觉伺服问题 |
 
 ## 系统依赖
 
@@ -110,6 +112,7 @@ pip install opencv-contrib-python pyrealsense2 numpy roboticstoolbox spatialmath
 1. **远距离跟随模式**：机器人在标记板上方一定距离跟随
 2. **静止检测**：当标记板连续静止超过设定时间后，自动切换到近处跟随
 3. **重新运动检测**：当标记板重新运动时，返回远距离跟随模式
+4. **盲逼近模式**：当启用 `--blind-final-approach` 参数时，在标记板静止时冻结目标位姿，退出视觉反馈，纯运动学伺服到目标位置
 
 ## 技术细节
 
@@ -124,6 +127,7 @@ pip install opencv-contrib-python pyrealsense2 numpy roboticstoolbox spatialmath
 - 时序优化：相机检测与控制分离保证实时性
 - 误差处理：包含 NaN/Inf 检测和处理
 - 参数限幅：防止过度运动导致的不稳定
+- 性能优化：使用快速旋转角度计算替换耗时的 SVD 正交化
 
 ## 开发与调试
 
@@ -134,6 +138,9 @@ python scripts/main_pbvs.py --diagnose-timing
 
 # 降低控制频率进行测试
 python scripts/main_pbvs.py --servo-hz 50
+
+# 启用盲逼近模式
+python scripts/main_pbvs.py --blind-final-approach
 
 # 查看帮助信息
 python scripts/main_pbvs.py --help
@@ -150,3 +157,4 @@ python scripts/main_pbvs.py --help
 - 支持 Fairino FR5 机器人
 - 基于 Python 3.8+
 - 依赖 OpenCV 4.x 和 Robotics Toolbox
+- 当前版本包含性能优化和盲逼近功能

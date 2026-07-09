@@ -21,7 +21,7 @@ RealSense D435 实时 ArUco 坐标系检测模块。
 import argparse
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import cv2
 import numpy as np
@@ -118,6 +118,69 @@ def estimate_marker_poses(corners, marker_length, camera_matrix, dist_coeffs) ->
     return poses
 
 
+def estimate_marker_poses_robust(corners, marker_length, camera_matrix, dist_coeffs, 
+                                prev_poses: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
+    """
+    估计每个 marker 相对相机的位姿，采用多解消除策略以避免相机正对时的解跳变。
+    
+    在相机接近正对 marker 时（俯视悬停场景很常见），cv2.solvePnP(IPPE_SQUARE) 
+    天生存在两个数值接近的候选解，容易在帧间随机跳变，造成视觉伺服抖动。
+    本函数通过比较与上一帧姿态的相似度，选择时序上更一致的解。
+    """
+    half = marker_length / 2.0
+    obj_points = np.array([
+        [-half,  half, 0],
+        [ half,  half, 0],
+        [ half, -half, 0],
+        [-half, -half, 0],
+    ], dtype=np.float64)
+
+    poses = []
+    for i, c in enumerate(corners):
+        img_points = c.reshape(4, 2).astype(np.float64)
+        
+        # 获取两个可能的解
+        solutions = []
+        for flags in [cv2.SOLVEPNP_IPPE_SQUARE, cv2.SOLVEPNP_IPPE_SQUARE]:
+            ok, rvec, tvec = cv2.solvePnP(
+                obj_points, img_points, camera_matrix, dist_coeffs,
+                flags=flags
+            )
+            if ok:
+                R, _ = cv2.Rodrigues(rvec)
+                T = np.eye(4)
+                T[:3, :3] = R
+                T[:3, 3] = tvec.flatten()
+                solutions.append(T)
+        
+        # 如果只有一个解或没有解，直接返回
+        if len(solutions) <= 1:
+            poses.append(solutions[0] if solutions else None)
+            continue
+            
+        # 如果有多个解，选择与上一帧最相似的解
+        if prev_poses is not None and i < len(prev_poses) and prev_poses[i] is not None:
+            # 计算与上一帧解的相似度（使用旋转矩阵的Frobenius范数）
+            best_solution = solutions[0]
+            best_similarity = -np.inf
+            
+            for sol in solutions:
+                # 计算旋转矩阵差异
+                diff = np.abs(sol[:3, :3] - prev_poses[i][:3, :3])
+                similarity = -np.linalg.norm(diff, 'fro')  # 负值表示越接近越好
+                
+                if similarity > best_similarity:
+                    best_similarity = similarity
+                    best_solution = sol
+                    
+            poses.append(best_solution)
+        else:
+            # 没有上一帧信息时，选择第一个解
+            poses.append(solutions[0])
+            
+    return poses
+
+
 def transform_pose(cam_T_marker: np.ndarray, hand_eye: Optional[dict],
                     base_T_gripper: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
     """
@@ -165,7 +228,7 @@ def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
             vis = frame.copy()
             if ids is not None and len(ids) > 0:
                 cv2.aruco.drawDetectedMarkers(vis, corners, ids)
-                poses = estimate_marker_poses(corners, marker_length, camera_matrix, dist_coeffs)
+                poses = estimate_marker_poses_robust(corners, marker_length, camera_matrix, dist_coeffs, prev_poses=None)
 
                 base_T_gripper = None
                 if hand_eye is not None and hand_eye["mode"] == "eye_in_hand" and pose_provider:

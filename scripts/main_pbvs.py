@@ -61,7 +61,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
 import cv2
 import numpy as np
@@ -73,6 +73,7 @@ from algorithm.aruco_detector import (
     load_hand_eye,
     detect_markers,
     estimate_marker_poses,
+    estimate_marker_poses_robust,
 )
 from algorithm.Pbvs import (
     PBVSController,
@@ -138,6 +139,8 @@ class VisionWorker(threading.Thread):
         # 回调: () -> List[str], 用于在预览窗口叠加控制线程状态
         self.status_text_fn = status_text_fn
         self.stream = RealSenseColorStream()
+        # 保存上一帧的marker姿态，用于多解消除
+        self.prev_marker_poses: Optional[List[np.ndarray]] = None
 
     def run(self):
         print("[视觉线程] 启动, 按预览窗口 'q' 可随时停止整个程序")
@@ -156,9 +159,12 @@ class VisionWorker(threading.Thread):
                     if self.marker_id is None or self.marker_id in flat_ids:
                         idx = flat_ids.index(
                             self.marker_id) if self.marker_id is not None else 0
-                        poses = estimate_marker_poses([corners[idx]], self.marker_length,
-                                                      self.camera_matrix, self.dist_coeffs)
+                        poses = estimate_marker_poses_robust([corners[idx]], self.marker_length,
+                                                      self.camera_matrix, self.dist_coeffs, 
+                                                      prev_poses=self.prev_marker_poses)
                         found_T = poses[0]
+                        # 更新上一帧的marker姿态
+                        self.prev_marker_poses = poses
                     cv2.aruco.drawDetectedMarkers(vis, corners, ids)
 
                 now = time.monotonic()
