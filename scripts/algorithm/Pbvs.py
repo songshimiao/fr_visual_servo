@@ -117,6 +117,20 @@ class PoseServoLaw:
     (每次调用前进一小步), 不依赖任何机器人模型, 也不依赖时间步长 dt——
     每次 step() 调用代表"一个控制周期", 步长限幅的物理意义是"每周期最多走
     多远", 因此与调用频率(main_pbvs.py 里的 --servo-hz)是绑定的。
+
+    ⚠️ max_translation_step/max_rotation_step 只限制"每步最大能走多远"(相当于
+    限速), 不限制"这一步比上一步能快多少"。当误差突然变大(比如程序刚启动时
+    机械臂离目标很远, 或者悬停距离从 hover_far 瞬间切到 hover_near), 步长会在
+    单个控制周期内直接从很小(甚至0)跳到最大限幅值——这是一次指令速度的阶跃,
+    对应极高的瞬时加速度需求, 是"启动瞬间/远近切换瞬间机械臂剧烈抖动"的直接
+    原因(而不是"离目标越远加速度越大"; 真正的问题是步长上限本身没有被平滑
+    地"爬升"到, 而是一步到位)。
+
+    max_translation_accel/max_rotation_accel 就是为了修这个问题加的: 限制
+    "本周期步长"相对"上一周期步长"最多能增加多少, 让步长从 0 平滑爬升到
+    max_translation_step/max_rotation_step(类似梯形/S形速度曲线的加速段),
+    而不是一步跳变到最大值。跟踪阶段误差本来就小, 步长远低于上限, 这层限制
+    基本不会被触发, 不影响平滑跟随时的响应速度。
     """
 
     RESULT_WORKING = 0
@@ -133,7 +147,11 @@ class PoseServoLaw:
             # base 坐标系下工作空间上限 [x,y,z] (m), None=不限制
             workspace_max: Optional[np.ndarray] = None,
             position_error_threshold: float = 0.001,          # 位置收敛阈值 (m)
-            rotation_error_threshold: float = np.deg2rad(0.5)  # 旋转收敛阈值 (rad)
+            rotation_error_threshold: float = np.deg2rad(0.5),  # 旋转收敛阈值 (rad)
+            # 每周期允许的"平移步长变化量"上限(m), None=不限制(退化为原来的硬限幅行为)
+            max_translation_accel: Optional[float] = None,
+            # 每周期允许的"旋转步长变化量"上限(rad), None=不限制
+            max_rotation_accel: Optional[float] = None,
     ):
         self.kp = float(kp)
         self.max_translation_step = float(max_translation_step)
@@ -144,10 +162,22 @@ class PoseServoLaw:
             workspace_max, dtype=float) if workspace_max is not None else None
         self.position_error_threshold = float(position_error_threshold)
         self.rotation_error_threshold = float(rotation_error_threshold)
+        self.max_translation_accel = float(max_translation_accel) if max_translation_accel is not None else None
+        self.max_rotation_accel = float(max_rotation_accel) if max_rotation_accel is not None else None
         self.counter = 0
+        self._prev_translation_step_mag = 0.0
+        self._prev_rotation_step_mag = 0.0
 
     def reset(self):
+        """
+        重置内部状态。除了清零调用计数器, 也把"上一拍步长"归零, 让加速度限幅
+        重新从 0 开始爬升——在切换悬停距离(hover_far -> hover_near)、或从
+        视觉伺服切到盲逼近这类"目标位姿突变"的时刻主动调用一次, 可以确保
+        每次突变都平滑起步, 而不是延用切换前(可能已经很大)的步长。
+        """
         self.counter = 0
+        self._prev_translation_step_mag = 0.0
+        self._prev_rotation_step_mag = 0.0
 
     def _compute_increment(self, current_pose: SE3, desired_pose: SE3) -> Tuple[SE3, float, float]:
         """
@@ -174,6 +204,27 @@ class PoseServoLaw:
                 kp_orientation = self.max_rotation_step / rotation_error
         else:
             kp_orientation = 0.0
+
+        # ---- 加速度限幅(slew-rate limiting): 本周期步长不能比上一周期猛涨 ----
+        if self.max_translation_accel is not None and position_error > eps:
+            trans_step_mag = kp_position * position_error
+            allowed = self._prev_translation_step_mag + self.max_translation_accel
+            if trans_step_mag > allowed:
+                trans_step_mag = max(allowed, 0.0)
+                kp_position = trans_step_mag / position_error
+            self._prev_translation_step_mag = kp_position * position_error
+        elif position_error <= eps:
+            self._prev_translation_step_mag = 0.0
+
+        if self.max_rotation_accel is not None and rotation_error > eps:
+            rot_step_mag = kp_orientation * rotation_error
+            allowed = self._prev_rotation_step_mag + self.max_rotation_accel
+            if rot_step_mag > allowed:
+                rot_step_mag = max(allowed, 0.0)
+                kp_orientation = rot_step_mag / rotation_error
+            self._prev_rotation_step_mag = kp_orientation * rotation_error
+        elif rotation_error <= eps:
+            self._prev_rotation_step_mag = 0.0
 
         pose_incr = interp_pose_from_identity(
             error_pose, kp_position, kp_orientation)
@@ -222,6 +273,8 @@ class PBVSGains:
     workspace_max: Optional[np.ndarray] = None
     position_error_threshold: float = 0.001
     rotation_error_threshold: float = np.deg2rad(0.5)
+    max_translation_accel: Optional[float] = None
+    max_rotation_accel: Optional[float] = None
 
     def build(self) -> PoseServoLaw:
         return PoseServoLaw(
@@ -232,6 +285,8 @@ class PBVSGains:
             workspace_max=self.workspace_max,
             position_error_threshold=self.position_error_threshold,
             rotation_error_threshold=self.rotation_error_threshold,
+            max_translation_accel=self.max_translation_accel,
+            max_rotation_accel=self.max_rotation_accel,
         )
 
 

@@ -248,10 +248,18 @@ def main():
                         help="超过该时长未更新到marker观测则暂停伺服(秒), 默认0.5s")
     parser.add_argument("--kp", type=float, default=0.3,
                         help="比例增益(每周期误差的多少比例被走完, 0~1之间较合理), 默认0.3")
-    parser.add_argument("--max-translation-step", type=float, default=0.01,
+    parser.add_argument("--max-translation-step", type=float, default=0.005,
                         help="每个控制周期最大平移步长(m), 默认0.01m (配合--servo-hz决定等效速度)")
-    parser.add_argument("--max-rotation-step-deg", type=float, default=5.0,
+    parser.add_argument("--max-rotation-step-deg", type=float, default=2.0,
                         help="每个控制周期最大旋转步长(度), 默认5deg")
+    parser.add_argument("--max-translation-accel", type=float, default=None,
+                        help="每个控制周期允许的'平移步长变化量'上限(m), 用于限制步长从0"
+                        "爬升到--max-translation-step的速度, 消除启动瞬间/hover_far<->"
+                        "hover_near切换瞬间的速度阶跃(剧烈抖动的根因)。默认="
+                        "max-translation-step的1/5(约5拍爬满)")
+    parser.add_argument("--max-rotation-accel-deg", type=float, default=None,
+                        help="每个控制周期允许的'旋转步长变化量'上限(度), 默认="
+                        "max-rotation-step-deg的1/5")
     parser.add_argument("--position-error-threshold", type=float, default=0.001,
                         help="位置收敛阈值(m), 默认1mm")
     parser.add_argument("--rotation-error-threshold-deg", type=float, default=0.5,
@@ -308,6 +316,10 @@ def main():
         args.workspace_min) if args.workspace_min is not None else None
     workspace_max = np.array(
         args.workspace_max) if args.workspace_max is not None else None
+    max_translation_accel = args.max_translation_accel if args.max_translation_accel is not None \
+        else args.max_translation_step / 5.0
+    max_rotation_accel_deg = args.max_rotation_accel_deg if args.max_rotation_accel_deg is not None \
+        else args.max_rotation_step_deg / 5.0
     controller = PBVSController(
         kinematics_model,
         gains=PBVSGains(
@@ -319,6 +331,8 @@ def main():
             position_error_threshold=args.position_error_threshold,
             rotation_error_threshold=np.deg2rad(
                 args.rotation_error_threshold_deg),
+            max_translation_accel=max_translation_accel,
+            max_rotation_accel=np.deg2rad(max_rotation_accel_deg),
         ),
     )
     stillness_detector = MarkerStillnessDetector(
@@ -439,6 +453,13 @@ def main():
                 hover_distance = args.hover_near if approaching else args.hover_far
                 control_status["state"] = "close" if approaching else "servoing"
                 control_status["hover"] = hover_distance
+
+                if state != prev_hover_state:
+                    # hover_far<->hover_near 切换的瞬间, 目标位姿会突变(比如
+                    # 0.35m -> 0.04m), 主动重置加速度限幅的"上一拍步长", 让这次
+                    # 突变也从0平滑爬升, 而不是延用切换前(可能已经收敛到很小)的
+                    # 步长导致又一次速度阶跃。
+                    controller.law.reset()
 
                 if (args.blind_final_approach and
                         prev_hover_state != HoverStateMachine.APPROACHING and
