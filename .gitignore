@@ -4,3 +4,4 @@ scripts/algorithm/__pycache__
 scripts/robot/__pycache__
 scripts/robot/fairino
 scripts/robot/libfairino
+scripts/__pycache__
