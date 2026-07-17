@@ -66,6 +66,34 @@ class FairinoRobot(RobotBase):
         """
         return self._joint_limits
 
+    def check_joint_limits(self, joint_pos: JointPos, margin_rad: float = 0.0):
+        """
+        检查给定关节位置是否超出(或过于接近)关节限位。
+
+        用途: ikine_LM 是纯数值迭代求解, 不会主动把解约束在 qlim 之内, 所以 IK
+        算出来的解仍可能超出实际关节限位; 一旦把这种解通过 ServoJ 下发给控制器,
+        控制器会报 "PTP指令关节超限" 之类的错误, 且机械臂会直接"挂掉"停止响应,
+        必须去 WebApp 里手动复位才能继续。因此在下发前应主动做这一层检查, 提前
+        拦截, 而不是等控制器报错。
+
+        :param joint_pos: 待检查的关节位置 (rad)
+        :param margin_rad: 安全裕度 (rad), 正值表示比真实限位更早触发告警(留出
+                            缓冲区, 避免刚好卡在硬限位上, 更保守), 默认0表示只按
+                            真实限位判断
+        :return: (ok, violations)
+                 ok: bool, 全部关节都在(收紧后的)限位内时为 True
+                 violations: List[(joint_index, q_rad, qmin_rad, qmax_rad)],
+                             每一项对应一个超限的关节, joint_index 从0开始
+        """
+        q = np.asarray(joint_pos, dtype=float)
+        violations = []
+        for i, (qmin, qmax) in enumerate(self._joint_limits):
+            lo = qmin + margin_rad
+            hi = qmax - margin_rad
+            if q[i] < lo or q[i] > hi:
+                violations.append((i, float(q[i]), float(qmin), float(qmax)))
+        return len(violations) == 0, violations
+
     # -------------
     # 运动学方法
     # -------------

@@ -14,6 +14,7 @@
 - **新增PnP多解消除功能，解决相机正对时的视觉伺服抖动问题** ([详情](readme/2026-07-09_1_pnp_multisolution_elimination.md))
 - **新增机械臂运动抖动解决方案** ([详情](readme/2026-07-10_2_mechanical_jitter_solution.md))
 - **新增项目近期改动记录** ([详情](readme/2026-07-17_3_project_changes.md))
+- **新增关节限位检查功能** ([详情](readme/2026-07-17_4_joint_limit_check.md))
 
 ## 项目结构
 
@@ -53,6 +54,7 @@ fr_visual_servo/
 - **PnP多解消除**：解决相机正对marker时的解跳变问题，提升视觉伺服稳定性
 - **运动平滑优化**：解决机械臂启动和状态切换时的抖动问题
 - **标定精度提升**：基于更新的标定数据，提高系统定位精度
+- **关节限位检查**：主动检查关节位置是否超出安全范围，避免机械臂超限故障
 
 ## 使用方法
 
@@ -82,6 +84,7 @@ python scripts/main_pbvs.py --intrinsics resources/calibration/camera_intrinsics
 | `--hover-far` | 0.15 | 远距离悬停高度（米） |
 | `--hover-near` | 0.05 | 近距离悬停高度（米） |
 | `--blind-final-approach` | - | 启用"look-then-move"盲逼近模式，解决近距离视觉伺服问题 |
+| `--joint-limit-margin-deg` | 3.0 | 关节限位安全裕度(度)，提前预警的缓冲区大小 |
 
 ## 系统依赖
 
@@ -134,6 +137,7 @@ pip install opencv-contrib-python pyrealsense2 numpy roboticstoolbox spatialmath
 - 性能优化：使用快速旋转角度计算替换耗时的 SVD 正交化
 - **运动抖动优化**：解决机械臂启动和状态切换时的剧烈抖动问题
 - **标定精度提升**：基于更新的标定数据，提高系统定位精度
+- **关节限位保护**：主动检查关节位置安全范围，避免机械臂超限故障
 
 ## 开发与调试
 
@@ -163,4 +167,4 @@ python scripts/main_pbvs.py --help
 - 支持 Fairino FR5 机器人
 - 基于 Python 3.8+
 - 依赖 OpenCV 4.x 和 Robotics Toolbox
-- 当前版本包含性能优化、盲逼近功能、运动抖动解决方案和最新的标定数据
+- 当前版本包含性能优化、盲逼近功能、运动抖动解决方案、最新的标定数据和关节限位保护功能

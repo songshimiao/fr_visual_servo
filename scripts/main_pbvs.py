@@ -175,8 +175,10 @@ class VisionWorker(threading.Thread):
 
                 if self.status_text_fn is not None:
                     for i, line in enumerate(self.status_text_fn()):
+                        # 关节超限警告用红色高亮, 其余状态用绿色
+                        color = (0, 0, 255) if line.startswith("!!") else (0, 255, 0)
                         cv2.putText(vis, line, (20, 30 + 22 * i),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
                 cv2.imshow("PBVS - ArUco tracking", vis)
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     self.stop_event.set()
@@ -260,7 +262,7 @@ def main():
     parser.add_argument("--max-rotation-accel-deg", type=float, default=None,
                         help="每个控制周期允许的'旋转步长变化量'上限(度), 默认="
                         "max-rotation-step-deg的1/5")
-    parser.add_argument("--position-error-threshold", type=float, default=0.001,
+    parser.add_argument("--position-error-threshold", type=float, default=0.008,
                         help="位置收敛阈值(m), 默认1mm")
     parser.add_argument("--rotation-error-threshold-deg", type=float, default=0.5,
                         help="姿态收敛阈值(度), 默认0.5deg")
@@ -282,6 +284,10 @@ def main():
                         dest="diagnose_timing", action="store_false")
     parser.add_argument("--execute", action="store_true",
                         help="关闭dry-run, 实际下发ServoJ")
+    parser.add_argument("--joint-limit-margin-deg", type=float, default=3.0,
+                        help="关节限位安全裕度(度): IK解出的目标关节角与真实限位的"
+                        "距离小于该值就视为'超限', 提前暂停下发, 而不是等到真的碰到"
+                        "硬限位/控制器报错才发现, 默认3deg")
     args = parser.parse_args()
 
     camera_matrix, dist_coeffs = load_camera_intrinsics(Path(args.intrinsics))
@@ -356,15 +362,19 @@ def main():
 
     # 供预览窗口显示当前控制线程状态
     control_status = {"state": "wait", "hover": args.hover_far, "still_span": 0.0,
-                      "pos_std_mm": 0.0, "ang_std_deg": 0.0}
+                      "pos_std_mm": 0.0, "ang_std_deg": 0.0, "joint_limit_msg": ""}
+    joint_limit_margin_rad = np.deg2rad(args.joint_limit_margin_deg)
 
     def status_text_fn():
-        return [
+        lines = [
             f"state: {control_status['state']}",
             f"hover: {control_status['hover']*1000:.0f}mm",
             f"still_span: {control_status['still_span']:.1f}/{args.settle_time:.1f}s",
             f"noise: pos_std={control_status['pos_std_mm']:.1f}mm ang_std={control_status['ang_std_deg']:.2f}deg",
         ]
+        if control_status["joint_limit_msg"]:
+            lines.append(f"!! JOINT LIMIT: {control_status['joint_limit_msg']}")
+        return lines
 
     vision = VisionWorker(
         camera_matrix, dist_coeffs, args.marker_length, args.dict, args.marker_id,
@@ -413,6 +423,7 @@ def main():
     blind_target_flange = None
     blind_done_announced = False
     prev_hover_state = HoverStateMachine.TRACKING
+    last_joint_limit_warn_t = 0.0
 
     print("[控制线程] 开始主循环, Ctrl+C 或预览窗口按 'q' 可停止")
     try:
@@ -491,6 +502,39 @@ def main():
                 time.sleep(dt)
                 continue
 
+            # ---- 关节限位预检查 ----
+            # ikine_LM 是纯数值求解, 不保证解落在 qlim 之内; 一旦把超限的解通过
+            # ServoJ 下发给控制器, 控制器会报"PTP指令关节超限"并直接停止响应,
+            # 只能去 WebApp 里手动复位才能继续, 代价很高。所以这里在下发前主动
+            # 检查一遍, 一旦发现超限(或过于接近限位), 就:
+            #   1. 不下发这次ServoJ指令(机械臂保持不动, 不会真的撞限位)
+            #   2. 不把这个超限解作为下一次IK的种子(避免种子本身就在超限区域,
+            #      导致后续解一直被"吸"过去出不来)
+            #   3. 在预览窗口红色高亮提示, 并节流打印一次日志
+            #   4. 继续主循环(不退出程序), 等目标位姿重新落回可达范围后自动恢复
+            joint_limit_ok, joint_limit_violations = kinematics_model.check_joint_limits(
+                q_next, margin_rad=joint_limit_margin_rad)
+
+            if not joint_limit_ok:
+                violation_strs = [
+                    f"j{idx + 1}={np.degrees(qv):.1f}deg(limit {np.degrees(qmin):.1f}~{np.degrees(qmax):.1f})"
+                    for idx, qv, qmin, qmax in joint_limit_violations
+                ]
+                control_status["joint_limit_msg"] = "; ".join(violation_strs)
+                control_status["state"] = "JOINT LIMIT-paused"
+
+                now_t = time.monotonic()
+                if now_t - last_joint_limit_warn_t > 1.0:
+                    print(f"\n[警告] 目标关节角超出限位(含{np.degrees(joint_limit_margin_rad):.1f}deg安全裕度), "
+                          f"暂停下发, 机械臂保持不动, 等目标恢复到可达范围后自动继续: "
+                          f"{control_status['joint_limit_msg']}")
+                    last_joint_limit_warn_t = now_t
+
+                elapsed = time.monotonic() - loop_t0
+                time.sleep(max(0.0, dt - elapsed))
+                continue
+
+            control_status["joint_limit_msg"] = ""
             q_seed = q_next  # 下一周期 IK 的迭代种子, 保证解的连续性
 
             pos_err_mm = pos_err * 1000.0
