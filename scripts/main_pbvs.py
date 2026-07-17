@@ -222,9 +222,9 @@ def main():
     parser.add_argument("--settle-time", type=float,
                         default=3.0, help="判定marker静止所需的连续时长(秒), 默认3s")
     parser.add_argument("--settle-pos-thresh", type=float,
-                        default=0.003, help="静止判定的位置阈值(米), 默认3mm")
+                        default=0.0008, help="静止判定的位置阈值(米), 默认3mm")
     parser.add_argument("--settle-ang-thresh", type=float,
-                        default=2.0, help="静止判定的姿态阈值(度), 默认2deg")
+                        default=0.6, help="静止判定的姿态阈值(度), 默认2deg")
     parser.add_argument("--resume-pos-thresh", type=float, default=None,
                         help="从'靠近'状态退回'跟随'所需的位移量(米), 默认=settle-pos-thresh的4倍"
                         "(需明显大于静止判定阈值, 否则噪声会导致状态反复横跳)")
@@ -534,7 +534,7 @@ def main():
         if args.execute:
             try:
                 rpc_robot.ServoMoveEnd()
-                rpc_robot.MoveJ([90, -90, 90, -90, -90, -90], tool=0, user=0)
+                rpc_robot.MoveJ([90, -90, 90, -90, -90, 0], tool=0, user=0)
             except AttributeError:
                 pass
             except Exception as e:
