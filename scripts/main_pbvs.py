@@ -53,7 +53,8 @@ scripts/main_pbvs.py
        --max-rotation-step-deg 参数; 注意这些是"每个控制周期最多走多远", 与
        --servo-hz 是绑定的, 调高频率或增益前请先小范围试跑), 正式使用前请结合
        现场情况调整。可选 --workspace-min/--workspace-max 提供一层工作空间硬限幅。
-    4. 按 'q' 可随时停止相机预览窗口并触发退出流程(会调用 ServoMoveEnd 并停止相机)。
+    4. 网页结束按钮或网页 q 键触发退出流程(包括 ServoMoveEnd 和原有回位动作)，
+       终端 Ctrl+C 也可退出。网页结束不是硬件急停。
 """
 
 import argparse
@@ -66,6 +67,8 @@ from typing import Optional, List
 import cv2
 import numpy as np
 from spatialmath import SE3
+
+from algorithm.web_preview import WebPreview, add_web_arguments
 
 from algorithm.aruco_detector import (
     RealSenseColorStream,
@@ -122,12 +125,12 @@ class SharedMarkerState:
 class VisionWorker(threading.Thread):
     """
     相机检测线程: 持续抓取 RealSense 彩色帧, 检测 ArUco marker, 更新共享状态,
-    并显示预览窗口(按 'q' 触发全局停止)。
+    并发布网页预览(网页结束按钮或 q 键触发全局停止)。
     """
 
     def __init__(self, camera_matrix, dist_coeffs, marker_length: float, dict_name: str,
                  marker_id: Optional[int], shared_state: SharedMarkerState,
-                 stop_event: threading.Event, status_text_fn=None):
+                 stop_event: threading.Event, preview: WebPreview, status_text_fn=None):
         super().__init__(daemon=True)
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
@@ -138,12 +141,21 @@ class VisionWorker(threading.Thread):
         self.stop_event = stop_event
         # 回调: () -> List[str], 用于在预览窗口叠加控制线程状态
         self.status_text_fn = status_text_fn
-        self.stream = RealSenseColorStream()
+        self.preview = preview
         # 保存上一帧的marker姿态，用于多解消除
         self.prev_marker_poses: Optional[List[np.ndarray]] = None
 
     def run(self):
-        print("[视觉线程] 启动, 按预览窗口 'q' 可随时停止整个程序")
+        try:
+            with self.preview:
+                self.stream = RealSenseColorStream()
+                self._run_detection()
+        finally:
+            # Also stop the control loop if camera/server startup or detection fails.
+            self.stop_event.set()
+
+    def _run_detection(self):
+        print("[视觉线程] 启动, 在网页中结束程序，或在终端按 Ctrl+C")
         try:
             while not self.stop_event.is_set():
                 frame = self.stream.get_frame()
@@ -179,13 +191,9 @@ class VisionWorker(threading.Thread):
                         color = (0, 0, 255) if line.startswith("!!") else (0, 255, 0)
                         cv2.putText(vis, line, (20, 30 + 22 * i),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                cv2.imshow("PBVS - ArUco tracking", vis)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    self.stop_event.set()
-                    break
+                self.preview.publish(vis)
         finally:
             self.stream.stop()
-            cv2.destroyAllWindows()
             print("[视觉线程] 已停止")
 
 
@@ -211,6 +219,7 @@ def _try_servo_j(rpc_robot, joint_deg_target: list, vel_percent: float):
 
 def main():
     parser = argparse.ArgumentParser(description="PBVS 实时视觉伺服跟随 + 静止后靠近")
+    add_web_arguments(parser)
     parser.add_argument("--intrinsics", type=str,
                         default="resources/calibration/camera_intrinsics.json")
     parser.add_argument("--hand-eye", type=str,
@@ -262,9 +271,9 @@ def main():
     parser.add_argument("--max-rotation-accel-deg", type=float, default=None,
                         help="每个控制周期允许的'旋转步长变化量'上限(度), 默认="
                         "max-rotation-step-deg的1/5")
-    parser.add_argument("--position-error-threshold", type=float, default=0.008,
+    parser.add_argument("--position-error-threshold", type=float, default=0.0005,
                         help="位置收敛阈值(m), 默认1mm")
-    parser.add_argument("--rotation-error-threshold-deg", type=float, default=0.5,
+    parser.add_argument("--rotation-error-threshold-deg", type=float, default=0.1,
                         help="姿态收敛阈值(度), 默认0.5deg")
     parser.add_argument("--workspace-min", type=float, nargs=3, default=None,
                         metavar=("X_MIN", "Y_MIN", "Z_MIN"),
@@ -379,6 +388,7 @@ def main():
     vision = VisionWorker(
         camera_matrix, dist_coeffs, args.marker_length, args.dict, args.marker_id,
         shared_state, stop_event, status_text_fn=status_text_fn,
+        preview=WebPreview.from_args(args, title="PBVS - ArUco tracking", stop_event=stop_event),
     )
     vision.start()
 
@@ -388,6 +398,7 @@ def main():
     while shared_state.read()[0] is None:
         if stop_event.is_set():
             print("[退出] 用户提前停止")
+            vision.join(timeout=5.0)
             return
         if time.monotonic() - t_wait0 > 20.0:
             print("[错误] 20秒内未检测到 marker, 请检查标定板是否在相机视野内, 退出")
@@ -399,7 +410,7 @@ def main():
     if args.execute:
         confirm = input("\n即将进入实时伺服跟随并下发运动指令, "
                         "确认机械臂周围安全、已准备好急停开关? (yes/no): ")
-        if confirm.strip().lower() != "yes":
+        if confirm.strip().lower() != "yes" or stop_event.is_set():
             print("用户取消, 退出")
             stop_event.set()
             vision.join(timeout=2.0)

@@ -34,6 +34,11 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
+if __package__:
+    from .web_preview import WebPreview, add_web_arguments
+else:
+    from web_preview import WebPreview, add_web_arguments
+
 
 # --------------------------------------------------------------------------- #
 # ChArUco 标定板配置 —— 按实际标定板参数设置 (5x7, 15mm/11mm, DICT_4X4)
@@ -128,7 +133,7 @@ class RealSenseCamera:
 # 1. 内参标定
 # -------------------------
 def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
-                           num_images: int, save_dir: Optional[Path] = None
+                           num_images: int, save_dir: Optional[Path] = None, *, preview: WebPreview
                            ) -> Tuple[list, list, Tuple[int, int]]:
     """
     实时采集 ChArUco 图像。按 's' 保存当前帧用于标定，按 'q' 提前结束。
@@ -138,8 +143,8 @@ def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
     image_size = None
     saved = 0
 
-    print(f"[采集] 目标 {num_images} 张有效图像. 按 's' 采集, 按 'q' 结束.")
-    while saved < num_images:
+    print(f"[采集] 目标 {num_images} 张有效图像. 在网页中采集/结束 (s/q).")
+    while saved < num_images and not preview.stop_event.is_set():
         frame = camera.get_color_frame()
         if frame is None:
             continue
@@ -153,8 +158,8 @@ def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
 
         cv2.putText(vis, f"Saved: {saved}/{num_images}  [s]=save [q]=quit",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-        cv2.imshow("ChArUco Intrinsic Calibration", vis)
-        key = cv2.waitKey(1) & 0xFF
+        preview.publish(vis)
+        key = preview.poll_key()
 
         if key == ord('s') and ch_corners is not None:
             all_corners.append(ch_corners)
@@ -167,7 +172,6 @@ def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
         elif key == ord('q'):
             break
 
-    cv2.destroyAllWindows()
     return all_corners, all_ids, image_size
 
 
@@ -244,7 +248,7 @@ def estimate_target_pose_in_camera(gray, board, aruco_dict, camera_matrix, dist_
 def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
                              camera_matrix, dist_coeffs,
                              pose_provider: RobotPoseProvider,
-                             num_poses: int
+                             num_poses: int, *, preview: WebPreview
                              ) -> Tuple[list, list, list, list]:
     """
     交互式采集手眼标定样本。
@@ -254,10 +258,10 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
     R_g2b, t_g2b, R_t2c, t_t2c = [], [], [], []
     saved = 0
     print(f"[采集] 手眼标定需要 {num_poses} 组不同姿态样本。")
-    print("       每次移动机械臂后按 's' 采集一帧，按 'q' 结束。")
+    print("       每次移动机械臂后，在网页中采集一帧(s)，或结束采集(q)。")
     print("       建议：姿态尽量覆盖不同的旋转方向，避免运动轨迹退化。")
 
-    while saved < num_poses:
+    while saved < num_poses and not preview.stop_event.is_set():
         frame = camera.get_color_frame()
         if frame is None:
             continue
@@ -270,8 +274,8 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
         status = "标定板: 已检测" if cam_T_target is not None else "标定板: 未检测"
         cv2.putText(vis, f"{status}  Saved:{saved}/{num_poses}  [s]=save [q]=quit",
                     (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        cv2.imshow("Hand-Eye Calibration", vis)
-        key = cv2.waitKey(1) & 0xFF
+        preview.publish(vis)
+        key = preview.poll_key()
 
         if key == ord('s'):
             if cam_T_target is None:
@@ -287,7 +291,6 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
         elif key == ord('q'):
             break
 
-    cv2.destroyAllWindows()
     return R_g2b, t_g2b, R_t2c, t_t2c
 
 
@@ -374,11 +377,13 @@ def main():
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p1 = sub.add_parser("intrinsic", help="内参标定")
+    add_web_arguments(p1)
     p1.add_argument("--num-images", type=int, default=20)
     p1.add_argument("--out", type=str, default="resources/calibration/camera_intrinsics.json")
     p1.add_argument("--save-images-dir", type=str, default=None)
 
     p2 = sub.add_parser("extrinsic", help="手眼标定 (手动选择 eye_in_hand / eye_to_hand)")
+    add_web_arguments(p2)
     p2.add_argument("--mode", choices=["eye_in_hand", "eye_to_hand"], required=True)
     p2.add_argument("--num-poses", type=int, default=15)
     p2.add_argument("--intrinsics", type=str, default="resources/calibration/camera_intrinsics.json")
@@ -389,54 +394,55 @@ def main():
     args = parser.parse_args()
     board, aruco_dict = _make_charuco_board()
 
-    if args.cmd == "intrinsic":
-        camera = RealSenseCamera()
-        try:
-            save_dir = Path(args.save_images_dir) if args.save_images_dir else None
-            corners, ids, size = collect_charuco_images(
-                camera, board, aruco_dict, args.num_images, save_dir
-            )
-            if len(corners) < 4:
-                print("[错误] 有效样本不足, 至少需要 4 张不同角度的图像")
-                return
-            result = calibrate_intrinsics(corners, ids, board, size)
-            save_json(result, Path(args.out))
-        finally:
-            camera.stop()
+    with WebPreview.from_args(args, title="Camera calibration", allow_capture=True) as preview:
+        if args.cmd == "intrinsic":
+            camera = RealSenseCamera()
+            try:
+                save_dir = Path(args.save_images_dir) if args.save_images_dir else None
+                corners, ids, size = collect_charuco_images(
+                    camera, board, aruco_dict, args.num_images, save_dir, preview=preview
+                )
+                if len(corners) < 4:
+                    print("[错误] 有效样本不足, 至少需要 4 张不同角度的图像")
+                    return
+                result = calibrate_intrinsics(corners, ids, board, size)
+                save_json(result, Path(args.out))
+            finally:
+                camera.stop()
 
-    elif args.cmd == "extrinsic":
-        import sys
-        sys.path.append(str(Path(__file__).resolve().parents[1]))
-        from robot.fairino import Robot
-        from robot.fairino_robot import FairinoRobot
+        elif args.cmd == "extrinsic":
+            import sys
+            sys.path.append(str(Path(__file__).resolve().parents[1]))
+            from robot.fairino import Robot
+            from robot.fairino_robot import FairinoRobot
 
-        print(f"[connect] 正在连接机械臂控制器 {args.ip} ...")
-        rpc_robot = Robot.RPC(args.ip)
-        print("[connect] 连接成功")
+            print(f"[connect] 正在连接机械臂控制器 {args.ip} ...")
+            rpc_robot = Robot.RPC(args.ip)
+            print("[connect] 连接成功")
 
-        def get_joint_deg_fn() -> list:
-            err, joint_deg = rpc_robot.GetActualJointPosDegree()
-            if err != 0:
-                raise RuntimeError(f"读取当前关节位置失败")
-            return joint_deg
+            def get_joint_deg_fn() -> list:
+                err, joint_deg = rpc_robot.GetActualJointPosDegree()
+                if err != 0:
+                    raise RuntimeError(f"读取当前关节位置失败")
+                return joint_deg
 
-        camera_matrix, dist_coeffs = load_intrinsics_for_cv(Path(args.intrinsics))
-        camera = RealSenseCamera()
-        kinematics_model = FairinoRobot(model_name=args.robot_model)
-        pose_provider = RobotPoseProvider(kinematics_model, get_joint_deg_fn)
+            camera_matrix, dist_coeffs = load_intrinsics_for_cv(Path(args.intrinsics))
+            camera = RealSenseCamera()
+            kinematics_model = FairinoRobot(model_name=args.robot_model)
+            pose_provider = RobotPoseProvider(kinematics_model, get_joint_deg_fn)
 
-        try:
-            R_g2b, t_g2b, R_t2c, t_t2c = collect_hand_eye_samples(
-                camera, board, aruco_dict, camera_matrix, dist_coeffs,
-                pose_provider, args.num_poses
-            )
-            if len(R_g2b) < 3:
-                print("[错误] 有效样本不足，至少需要 3 组不同姿态")
-                return
-            result = calibrate_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c, args.mode)
-            save_json(result, Path(args.out))
-        finally:
-            camera.stop()
+            try:
+                R_g2b, t_g2b, R_t2c, t_t2c = collect_hand_eye_samples(
+                    camera, board, aruco_dict, camera_matrix, dist_coeffs,
+                    pose_provider, args.num_poses, preview=preview
+                )
+                if len(R_g2b) < 3:
+                    print("[错误] 有效样本不足，至少需要 3 组不同姿态")
+                    return
+                result = calibrate_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c, args.mode)
+                save_json(result, Path(args.out))
+            finally:
+                camera.stop()
 
 
 if __name__ == "__main__":

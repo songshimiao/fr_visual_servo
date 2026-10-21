@@ -1,4 +1,7 @@
 .vscode
+.agents
+.aws
+.codex
 resources/intrinsics_img
 scripts/algorithm/__pycache__
 scripts/robot/__pycache__

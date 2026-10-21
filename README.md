@@ -15,6 +15,7 @@
 - **新增机械臂运动抖动解决方案** ([详情](readme/2026-07-10_2_mechanical_jitter_solution.md))
 - **新增项目近期改动记录** ([详情](readme/2026-07-17_3_project_changes.md))
 - **新增关节限位检查功能** ([详情](readme/2026-07-17_4_joint_limit_check.md))
+- **支持 Jetson 无显示器开发和网页视频监控** ([使用与改动记录](readme/2026-10-21_5_headless_web_monitoring.md))
 
 ## 项目结构
 
@@ -24,6 +25,7 @@ fr_visual_servo/
 │   ├── main_pbvs.py              # 主程序入口
 │   ├── algorithm/
 │   │   ├── aruco_detector.py     # ArUco 标记检测模块
+│   │   ├── web_preview.py        # 无显示器 MJPEG 网页预览与标定交互
 │   │   └── Pbvs.py               # PBVS 控制算法核心
 │   └── robot/
 │       ├── fairino_robot.py      # Fairino 机器人运动学实现
@@ -57,6 +59,27 @@ fr_visual_servo/
 - **关节限位检查**：主动检查关节位置是否超出安全范围，避免机械臂超限故障
 
 ## 使用方法
+
+### Jetson 无显示器远程监控
+
+相机入口默认启动网页视频流，不再创建 OpenCV 本地窗口。在 Jetson 项目根目录运行：
+
+```bash
+# 仅监控相机和 ArUco 检测，不连接机械臂；marker-length 按实际边长设置（米）
+python3 scripts/algorithm/aruco_detector.py \
+  --intrinsics resources/calibration/camera_intrinsics.json --marker-length 0.05
+
+# PBVS 主程序（默认 dry-run，需要机械臂在线）
+python3 scripts/main_pbvs.py
+```
+
+电脑浏览器访问 **http://192.168.66.80:8080/**。支持 `--web-port`、`--web-fps`、
+`--web-quality`、`--web-host` 和 `--no-web`。标定时在网页点击“采集一帧”或按 s；
+网页 q/结束按钮触发原有退出流程，执行模式下可能包含回位动作，并非急停。
+机器人执行确认仍在 SSH 终端进行。服务用于可信局域网，也可通过 SSH 转发访问。
+
+完整命令、标定操作、退出行为及离线测试见
+[无显示器网页监控记录](readme/2026-10-21_5_headless_web_monitoring.md)。
 
 ### 1. 运行主程序
 

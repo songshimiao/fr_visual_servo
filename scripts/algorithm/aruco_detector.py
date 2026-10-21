@@ -27,6 +27,11 @@ import cv2
 import numpy as np
 import pyrealsense2 as rs
 
+if __package__:
+    from .web_preview import WebPreview, add_web_arguments
+else:
+    from web_preview import WebPreview, add_web_arguments
+
 
 def _get_aruco_detector(dict_name: str):
     dict_id = getattr(cv2.aruco, dict_name)
@@ -214,11 +219,11 @@ def draw_axis(frame, camera_matrix, dist_coeffs, T: np.ndarray, length=0.03):
 
 
 def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
-                hand_eye: Optional[dict] = None, pose_provider=None):
+                hand_eye: Optional[dict] = None, pose_provider=None, *, preview: WebPreview):
     stream = RealSenseColorStream()
-    print("[运行] 按 'q' 退出")
+    print("[运行] 在网页中结束检测，或在终端按 Ctrl+C")
     try:
-        while True:
+        while preview.poll_key() != ord('q'):
             frame = stream.get_frame()
             if frame is None:
                 continue
@@ -252,16 +257,14 @@ def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
                     cv2.putText(vis, label, (int(corner_pt[0]), int(corner_pt[1]) - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-            cv2.imshow("ArUco Detection", vis)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            preview.publish(vis)
     finally:
         stream.stop()
-        cv2.destroyAllWindows()
 
 
 def main():
     parser = argparse.ArgumentParser(description="RealSense ArUco 坐标系检测")
+    add_web_arguments(parser)
     parser.add_argument("--intrinsics", type=str, required=True)
     parser.add_argument("--hand-eye", type=str, default=None,
                          help="可选：手眼标定结果 json, 用于换算到机器人基坐标系")
@@ -284,7 +287,10 @@ def main():
         sys.path.append(str(Path(__file__).resolve().parents[1]))  # 加入 scripts/ 目录
         from robot.fairino import Robot  # 官方 fairino Python SDK
         from robot.fairino_robot import FairinoRobot
-        from camera_calibration import RobotPoseProvider
+        if __package__:
+            from .camera_calibration import RobotPoseProvider
+        else:
+            from camera_calibration import RobotPoseProvider
 
         print(f"[connect] 正在连接机械臂控制器 {args.ip} ...")
         rpc_robot = Robot.RPC(args.ip)
@@ -299,8 +305,9 @@ def main():
         kinematics_model = FairinoRobot(model_name=args.robot_model)
         pose_provider = RobotPoseProvider(kinematics_model, get_joint_deg_fn)
 
-    run_stream(camera_matrix, dist_coeffs, args.marker_length, args.dict,
-               hand_eye=hand_eye, pose_provider=pose_provider)
+    with WebPreview.from_args(args, title="ArUco Detection") as preview:
+        run_stream(camera_matrix, dist_coeffs, args.marker_length, args.dict,
+                   hand_eye=hand_eye, pose_provider=pose_provider, preview=preview)
 
 
 if __name__ == "__main__":
