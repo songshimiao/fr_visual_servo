@@ -29,7 +29,7 @@ class WebPreview:
     """
 
     def __init__(self, host="0.0.0.0", port=8080, fps=10.0, quality=80,
-                 title="RealSense preview", allow_capture=False, stop_event=None,
+                 title="Camera preview", allow_capture=False, stop_event=None,
                  enabled=True):
         if not 0 <= port <= 65535:
             raise ValueError("web-port must be between 0 and 65535")
@@ -144,7 +144,7 @@ img{display:block;width:100%;height:auto;min-height:180px;background:#05090d;bor
 button{padding:12px 18px;margin:12px 12px 0 0;cursor:pointer}#status{padding:12px 0}
 .bad{color:#ffad8f}small{color:#bcc9da}</style>
 <h1>__TITLE__</h1><div id="status">等待第一帧…</div>
-<img id="video" src="/stream.mjpg" alt="RealSense 视频流">
+<img id="video" src="/stream.mjpg" alt="相机视频流">
 __CAPTURE__<button onclick="command('quit')">结束当前程序/采集 (q)</button>
 <p><small>结束按钮触发脚本原有退出流程，可能包含机械臂回位；不是急停。
 机械臂执行确认仍在 SSH 终端完成。关闭浏览器不会停止程序。</small></p>
@@ -180,14 +180,18 @@ document.addEventListener('keydown',e=>{if(e.repeat||/INPUT|TEXTAREA/.test(e.tar
                 pass
 
             def reply(self, code, data, content_type="application/json; charset=utf-8"):
-                self.send_response(code)
-                self.send_header("Content-Type", content_type)
-                self.send_header("Content-Length", str(len(data)))
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("X-Content-Type-Options", "nosniff")
-                self.send_header("X-Frame-Options", "DENY")
-                self.end_headers()
-                self.wfile.write(data)
+                try:
+                    self.send_response(code)
+                    self.send_header("Content-Type", content_type)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("X-Frame-Options", "DENY")
+                    self.end_headers()
+                    self.wfile.write(data)
+                except (OSError, TimeoutError):
+                    # Browsers may cancel status/page requests while the SDK starts.
+                    self.close_connection = True
 
             def do_GET(self):
                 path = urlsplit(self.path).path

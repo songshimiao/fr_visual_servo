@@ -1,7 +1,7 @@
 """
 scripts/algorithm/camera_calibration.py
 
-RealSense D435 相机标定模块
+RealSense / Orbbec Gemini 305 相机标定模块
 1. 内参标定: 使用 ChArUco 标定板 (cv2.aruco.calibrateCameraCharuco)
 2. 手眼标定: 支持 Eye-in-Hand (AX=XB) 与 Eye-to-Hand (AX=ZB), 标定结果保存为 json
 
@@ -32,11 +32,14 @@ from typing import Callable, List, Optional, Tuple
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
 
 if __package__:
+    from .camera_stream import (RealSenseColorStream, create_camera, add_camera_arguments,
+                                resolve_camera_arguments, validate_calibration)
     from .web_preview import WebPreview, add_web_arguments
 else:
+    from camera_stream import (RealSenseColorStream, create_camera, add_camera_arguments,
+                               resolve_camera_arguments, validate_calibration)
     from web_preview import WebPreview, add_web_arguments
 
 
@@ -94,39 +97,8 @@ def _detect_charuco(gray, board, aruco_dict):
     return ch_corners, ch_ids
 
 
-class RealSenseCamera:
-    """RealSense D435 彩色流采集封装"""
-
-    def __init__(self, width=640, height=480, fps=30):
-        self.pipeline = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        self.profile = self.pipeline.start(cfg)
-
-    def get_color_frame(self) -> Optional[np.ndarray]:
-        frames = self.pipeline.wait_for_frames()
-        color = frames.get_color_frame()
-        if not color:
-            return None
-        return np.asanyarray(color.get_data())
-
-    def get_rs_intrinsics(self) -> dict:
-        """读取 RealSense 出厂内参 (可作为标定初置参考, 或临时替代方案)"""
-        stream = self.profile.get_stream(rs.stream.color)
-        intr = stream.as_video_stream_profile().get_intrinsics()
-        return {
-            "width": intr.width,
-            "height": intr.height,
-            "fx": intr.fx,
-            "fy": intr.fy,
-            "cx": intr.ppx,
-            "cy": intr.ppy,
-            "dist_coeffs": list(intr.coeffs),
-            "model": str(intr.model),
-        }
-
-    def stop(self):
-        self.pipeline.stop()
+# Backward-compatible public name; CLI creation uses the selected backend.
+RealSenseCamera = RealSenseColorStream
 
 
 # -------------------------
@@ -373,30 +345,35 @@ def load_intrinsics_for_cv(path: Path) -> Tuple[np.ndarray, np.ndarray]:
 # CLI
 # -------------
 def main():
-    parser = argparse.ArgumentParser(description="RealSense D435 相机标定")
+    parser = argparse.ArgumentParser(description="RealSense / Orbbec Gemini 305 相机标定")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p1 = sub.add_parser("intrinsic", help="内参标定")
     add_web_arguments(p1)
+    add_camera_arguments(p1)
     p1.add_argument("--num-images", type=int, default=20)
-    p1.add_argument("--out", type=str, default="resources/calibration/camera_intrinsics.json")
+    p1.add_argument("--out", type=str, default=None)
     p1.add_argument("--save-images-dir", type=str, default=None)
 
     p2 = sub.add_parser("extrinsic", help="手眼标定 (手动选择 eye_in_hand / eye_to_hand)")
     add_web_arguments(p2)
+    add_camera_arguments(p2)
     p2.add_argument("--mode", choices=["eye_in_hand", "eye_to_hand"], required=True)
     p2.add_argument("--num-poses", type=int, default=15)
-    p2.add_argument("--intrinsics", type=str, default="resources/calibration/camera_intrinsics.json")
-    p2.add_argument("--out", type=str, default="resources/calibration/hand_eye_calibration.json")
+    p2.add_argument("--intrinsics", type=str, default=None)
+    p2.add_argument("--out", type=str, default=None)
     p2.add_argument("--robot-model", type=str, default="FR5", help="FairinoRobot 型号名")
     p2.add_argument("--ip", type=str, default="192.168.58.2", help="机械臂控制器 IP")
 
     args = parser.parse_args()
+    camera_settings = resolve_camera_arguments(args)
+    if args.cmd == "extrinsic":
+        validate_calibration(args.intrinsics, camera_settings)
     board, aruco_dict = _make_charuco_board()
 
     with WebPreview.from_args(args, title="Camera calibration", allow_capture=True) as preview:
         if args.cmd == "intrinsic":
-            camera = RealSenseCamera()
+            camera = create_camera(camera_settings)
             try:
                 save_dir = Path(args.save_images_dir) if args.save_images_dir else None
                 corners, ids, size = collect_charuco_images(
@@ -406,6 +383,7 @@ def main():
                     print("[错误] 有效样本不足, 至少需要 4 张不同角度的图像")
                     return
                 result = calibrate_intrinsics(corners, ids, board, size)
+                result["camera"] = camera.metadata
                 save_json(result, Path(args.out))
             finally:
                 camera.stop()
@@ -427,7 +405,7 @@ def main():
                 return joint_deg
 
             camera_matrix, dist_coeffs = load_intrinsics_for_cv(Path(args.intrinsics))
-            camera = RealSenseCamera()
+            camera = create_camera(camera_settings, [args.intrinsics])
             kinematics_model = FairinoRobot(model_name=args.robot_model)
             pose_provider = RobotPoseProvider(kinematics_model, get_joint_deg_fn)
 
@@ -440,6 +418,7 @@ def main():
                     print("[错误] 有效样本不足，至少需要 3 组不同姿态")
                     return
                 result = calibrate_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c, args.mode)
+                result["camera"] = camera.metadata
                 save_json(result, Path(args.out))
             finally:
                 camera.stop()

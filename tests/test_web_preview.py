@@ -24,7 +24,7 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
-from ..scripts.algorithm.web_preview import WebPreview  # noqa: F401
+from algorithm.web_preview import WebPreview  # noqa: F401
 
 
 def wait_until(predicate, timeout=3.0):
@@ -185,11 +185,14 @@ class CameraIntegrationTests(unittest.TestCase):
                        "__file__": str(ROOT / "scripts/visual_servo_hover_test.py"),
                        "threading": threading, "time": time,
                        "add_web_arguments": lambda parser: None,
+                       "add_camera_arguments": lambda parser: None,
+                       "resolve_camera_arguments": lambda args: (setattr(args, "intrinsics", "intr.json"), setattr(args, "hand_eye", "hand.json")),
+                       "validate_calibration": lambda *a: None,
                        "load_camera_intrinsics": lambda _: (None, None),
                        "load_hand_eye": lambda _: {"mode": "eye_in_hand", "T": None},
                        "np_to_SE3": lambda _: Pose(),
                        "WebPreview": types.SimpleNamespace(from_args=lambda *a, **kw: preview),
-                       "RealSenseColorStream": lambda: stream,
+                       "create_camera": lambda *a: stream,
                        "wait_for_stable_marker": reference,
                        "compute_target_flange_pose": lambda *a: Pose()}
                 main = isolated_definition("scripts/visual_servo_hover_test.py", "main", env)
@@ -254,7 +257,7 @@ class CameraIntegrationTests(unittest.TestCase):
     def test_vision_camera_failure_closes_preview_and_signals_stop(self):
         preview = WebPreview(host="127.0.0.1", port=0)
         env = {"threading": threading,
-               "RealSenseColorStream": Mock(side_effect=RuntimeError("camera absent"))}
+               "create_camera": Mock(side_effect=RuntimeError("camera absent"))}
         worker_class = isolated_definition("scripts/main_pbvs.py", "VisionWorker", env)
         stop = threading.Event()
         worker = worker_class(None, None, 0.05, "DICT_4X4_50", None, None, stop, preview)

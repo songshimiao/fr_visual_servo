@@ -8,3 +8,7 @@ scripts/robot/__pycache__
 scripts/robot/fairino
 scripts/robot/libfairino
 scripts/__pycache__
+
+# Local SDK logs and Python test caches
+Log/
+tests/__pycache__/

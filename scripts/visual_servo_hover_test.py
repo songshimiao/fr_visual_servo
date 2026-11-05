@@ -37,6 +37,8 @@ import cv2
 import numpy as np
 from spatialmath import SE3
 
+from algorithm.camera_stream import (create_camera, add_camera_arguments,
+                                     resolve_camera_arguments, validate_calibration)
 from algorithm.web_preview import WebPreview, add_web_arguments
 
 from algorithm.aruco_detector import (
@@ -155,8 +157,9 @@ def compute_target_flange_pose(base_T_flange_current: SE3, flange_T_cam: SE3,
 def main():
     parser = argparse.ArgumentParser(description="ArUco悬停定位精度验证 (相机/tool1)")
     add_web_arguments(parser)
-    parser.add_argument("--intrinsics", type=str, default="resources/calibration/camera_intrinsics.json")
-    parser.add_argument("--hand-eye", type=str, default="resources/calibration/hand_eye_calibration.json")
+    add_camera_arguments(parser)
+    parser.add_argument("--intrinsics", type=str, default=None)
+    parser.add_argument("--hand-eye", type=str, default=None)
     parser.add_argument("--mode", choices=["camera", "tool1"], required=True,
                          help="悬停在marker正上方的坐标系: camera 或 tool1")
     parser.add_argument("--hover-height", type=float, default=0.05, help="悬停高度(米)，默认5cm")
@@ -172,6 +175,10 @@ def main():
     parser.add_argument("--execute", action="store_true", help="关闭dry-run，实际下发MoveJ")
     args = parser.parse_args()
 
+    camera_settings = resolve_camera_arguments(args)
+    calibration_paths = [args.intrinsics, args.hand_eye]
+    for path in calibration_paths:
+        validate_calibration(path, camera_settings)
     camera_matrix, dist_coeffs = load_camera_intrinsics(Path(args.intrinsics))
     hand_eye = load_hand_eye(Path(args.hand_eye))
     if hand_eye["mode"] != "eye_in_hand":
@@ -196,7 +203,7 @@ def main():
         return np.radians(joint_deg)
 
     with WebPreview.from_args(args, title="Hover calibration check") as preview:
-        stream = RealSenseColorStream()
+        stream = create_camera(camera_settings, calibration_paths)
         motion_started = False
         monitor_stop = threading.Event()
         monitor_thread = None

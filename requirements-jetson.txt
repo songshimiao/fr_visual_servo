@@ -1,0 +1,12 @@
+# Tested on Jetson Ubuntu 22.04 / Python 3.10, RealSense + Fairino PBVS.
+# Keep NumPy 1.x for the installed OpenCV binary ABI.
+# pgraph-python 1.0.0 requires NumPy >=2; constrain this RTB dependency too.
+numpy==1.26.4
+pgraph-python==0.6.5
+opencv-contrib-python==4.10.0.84
+scipy==1.15.1
+matplotlib==3.10.6
+spatialmath-python==1.1.18
+spatialgeometry==1.4.2
+roboticstoolbox-python==1.4.4
+pyrealsense2==2.59.1.11053

@@ -1,7 +1,7 @@
 """
 scripts/algorithm/aruco_detector.py
 
-RealSense D435 实时 ArUco 坐标系检测模块。
+RealSense / Orbbec Gemini 305 实时 ArUco 坐标系检测模块。
 依赖 camera_calibration.py 产出的内参 (与可选的手眼标定结果)。
 
 依赖:
@@ -25,11 +25,14 @@ from typing import Optional, List
 
 import cv2
 import numpy as np
-import pyrealsense2 as rs
 
 if __package__:
+    from .camera_stream import (RealSenseColorStream, create_camera, add_camera_arguments,
+                                resolve_camera_arguments, validate_calibration)
     from .web_preview import WebPreview, add_web_arguments
 else:
+    from camera_stream import (RealSenseColorStream, create_camera, add_camera_arguments,
+                               resolve_camera_arguments, validate_calibration)
     from web_preview import WebPreview, add_web_arguments
 
 
@@ -42,24 +45,6 @@ def _get_aruco_detector(dict_name: str):
         return detector, None
     else:
         print(f"[OpenCV] 版本过低, OpenCV >= 4.7")
-
-
-class RealSenseColorStream:
-    def __init__(self, width=640, height=480, fps=30):
-        self.pipeline = rs.pipeline()
-        cfg = rs.config()
-        cfg.enable_stream(rs.stream.color, width, height, rs.format.bgr8, fps)
-        self.pipeline.start(cfg)
-
-    def get_frame(self) -> Optional[np.ndarray]:
-        frames = self.pipeline.wait_for_frames()
-        color = frames.get_color_frame()
-        if not color:
-            return None
-        return np.asanyarray(color.get_data())
-
-    def stop(self):
-        self.pipeline.stop()
 
 
 def load_camera_intrinsics(path: Path):
@@ -219,8 +204,9 @@ def draw_axis(frame, camera_matrix, dist_coeffs, T: np.ndarray, length=0.03):
 
 
 def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
-                hand_eye: Optional[dict] = None, pose_provider=None, *, preview: WebPreview):
-    stream = RealSenseColorStream()
+                hand_eye: Optional[dict] = None, pose_provider=None, *, preview: WebPreview,
+                camera_settings=None, calibration_paths=()):
+    stream = create_camera(camera_settings, calibration_paths)
     print("[运行] 在网页中结束检测，或在终端按 Ctrl+C")
     try:
         while preview.poll_key() != ord('q'):
@@ -263,9 +249,11 @@ def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
 
 
 def main():
-    parser = argparse.ArgumentParser(description="RealSense ArUco 坐标系检测")
+    parser = argparse.ArgumentParser(description="RealSense / Orbbec ArUco 坐标系检测")
     add_web_arguments(parser)
-    parser.add_argument("--intrinsics", type=str, required=True)
+    add_camera_arguments(parser)
+    parser.set_defaults(optional_hand_eye=True)
+    parser.add_argument("--intrinsics", type=str, default=None)
     parser.add_argument("--hand-eye", type=str, default=None,
                          help="可选：手眼标定结果 json, 用于换算到机器人基坐标系")
     parser.add_argument("--marker-length", type=float, default=0.04,
@@ -278,6 +266,10 @@ def main():
                          help="FairinoRobot 型号名 (仅 eye_in_hand 模式使用)")
     args = parser.parse_args()
 
+    camera_settings = resolve_camera_arguments(args)
+    calibration_paths = [args.intrinsics] + ([args.hand_eye] if args.hand_eye else [])
+    for path in calibration_paths:
+        validate_calibration(path, camera_settings)
     camera_matrix, dist_coeffs = load_camera_intrinsics(Path(args.intrinsics))
     hand_eye = load_hand_eye(Path(args.hand_eye)) if args.hand_eye else None
 
@@ -307,7 +299,8 @@ def main():
 
     with WebPreview.from_args(args, title="ArUco Detection") as preview:
         run_stream(camera_matrix, dist_coeffs, args.marker_length, args.dict,
-                   hand_eye=hand_eye, pose_provider=pose_provider, preview=preview)
+                   hand_eye=hand_eye, pose_provider=pose_provider, preview=preview,
+                   camera_settings=camera_settings, calibration_paths=calibration_paths)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,8 @@ import cv2
 import numpy as np
 from spatialmath import SE3
 
+from algorithm.camera_stream import (create_camera, add_camera_arguments,
+                                     resolve_camera_arguments, validate_calibration)
 from algorithm.web_preview import WebPreview, add_web_arguments
 
 from algorithm.aruco_detector import (
@@ -124,13 +126,14 @@ class SharedMarkerState:
 
 class VisionWorker(threading.Thread):
     """
-    相机检测线程: 持续抓取 RealSense 彩色帧, 检测 ArUco marker, 更新共享状态,
+    相机检测线程: 持续抓取所选相机彩色帧, 检测 ArUco marker, 更新共享状态,
     并发布网页预览(网页结束按钮或 q 键触发全局停止)。
     """
 
     def __init__(self, camera_matrix, dist_coeffs, marker_length: float, dict_name: str,
                  marker_id: Optional[int], shared_state: SharedMarkerState,
-                 stop_event: threading.Event, preview: WebPreview, status_text_fn=None):
+                 stop_event: threading.Event, preview: WebPreview, status_text_fn=None,
+                 camera_settings=None, calibration_paths=()):
         super().__init__(daemon=True)
         self.camera_matrix = camera_matrix
         self.dist_coeffs = dist_coeffs
@@ -142,13 +145,15 @@ class VisionWorker(threading.Thread):
         # 回调: () -> List[str], 用于在预览窗口叠加控制线程状态
         self.status_text_fn = status_text_fn
         self.preview = preview
+        self.camera_settings = camera_settings
+        self.calibration_paths = calibration_paths
         # 保存上一帧的marker姿态，用于多解消除
         self.prev_marker_poses: Optional[List[np.ndarray]] = None
 
     def run(self):
         try:
             with self.preview:
-                self.stream = RealSenseColorStream()
+                self.stream = create_camera(self.camera_settings, self.calibration_paths)
                 self._run_detection()
         finally:
             # Also stop the control loop if camera/server startup or detection fails.
@@ -220,10 +225,11 @@ def _try_servo_j(rpc_robot, joint_deg_target: list, vel_percent: float):
 def main():
     parser = argparse.ArgumentParser(description="PBVS 实时视觉伺服跟随 + 静止后靠近")
     add_web_arguments(parser)
+    add_camera_arguments(parser)
     parser.add_argument("--intrinsics", type=str,
-                        default="resources/calibration/camera_intrinsics.json")
+                        default=None)
     parser.add_argument("--hand-eye", type=str,
-                        default="resources/calibration/hand_eye_calibration.json")
+                        default=None)
     parser.add_argument("--mode", choices=["camera", "tool1"], default="camera",
                         help="悬停/跟随所依据的参考坐标系: camera(默认) 或 tool1")
     parser.add_argument("--hover-far", type=float,
@@ -281,8 +287,8 @@ def main():
     parser.add_argument("--workspace-max", type=float, nargs=3, default=None,
                         metavar=("X_MAX", "Y_MAX", "Z_MAX"),
                         help="可选: base坐标系下flange目标位姿的工作空间上限(m)")
-    parser.add_argument("--marker-filter-alpha", type=float, default=0.4,
-                        help="marker位置低通滤波系数(0,1], 越小越平滑, 默认0.4")
+    parser.add_argument("--marker-filter-alpha", type=float, default=0.1,
+                        help="marker位置低通滤波系数(0,1], 越小越平滑, 默认0.1")
     parser.add_argument("--marker-filter-alpha-rot", type=float, default=None,
                         help="marker姿态低通滤波系数(0,1], 默认与--marker-filter-alpha的1/4"
                         "(姿态噪声通常比位置大, 且z_align模式下姿态噪声会被放大成末端抖动,"
@@ -299,6 +305,10 @@ def main():
                         "硬限位/控制器报错才发现, 默认3deg")
     args = parser.parse_args()
 
+    camera_settings = resolve_camera_arguments(args)
+    calibration_paths = [args.intrinsics, args.hand_eye]
+    for path in calibration_paths:
+        validate_calibration(path, camera_settings)
     camera_matrix, dist_coeffs = load_camera_intrinsics(Path(args.intrinsics))
     hand_eye = load_hand_eye(Path(args.hand_eye))
     if hand_eye["mode"] != "eye_in_hand":
@@ -388,6 +398,7 @@ def main():
     vision = VisionWorker(
         camera_matrix, dist_coeffs, args.marker_length, args.dict, args.marker_id,
         shared_state, stop_event, status_text_fn=status_text_fn,
+        camera_settings=camera_settings, calibration_paths=calibration_paths,
         preview=WebPreview.from_args(args, title="PBVS - ArUco tracking", stop_event=stop_event),
     )
     vision.start()
