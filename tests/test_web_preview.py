@@ -88,6 +88,52 @@ class PreviewTests(unittest.TestCase):
             conn.close()
         self.assertFalse(self.preview.stop_event.is_set())
 
+    def test_two_real_streams_and_independent_save_requests(self):
+        self.preview.close()
+        self.preview = WebPreview(host="127.0.0.1", port=0, fps=60, allow_capture=True)
+        secondary = self.preview.add_channel("secondary", "Gemini 335 / Eye-to-Hand")
+        self.preview.start()
+        frames = {"primary": np.full((24, 32, 3), (0, 0, 220), np.uint8),
+                  "secondary": np.full((24, 32, 3), (0, 220, 0), np.uint8)}
+        for name, frame in frames.items():
+            self.preview.channels[name].publish(frame)
+        wait_until(lambda: all(c.status()["frame_sequence"] for c in self.preview.channels.values()))
+        page = self.request("/")[1]
+        self.assertEqual(page.count(b"<button data-capture="), 2)
+        for name, frame in frames.items():
+            self.assertIn(f'/stream/{name}.mjpg'.encode(), page)
+            conn = http.client.HTTPConnection("127.0.0.1", self.preview.port, timeout=3)
+            conn.request("GET", f"/stream/{name}.mjpg")
+            response = conn.getresponse()
+            self.assertEqual(response.status, 200)
+            response.readline()
+            response.readline()
+            length = int(response.readline().split(b":")[1])
+            response.readline()
+            decoded = cv2.imdecode(np.frombuffer(response.read(length), np.uint8), cv2.IMREAD_COLOR)
+            np.testing.assert_allclose(decoded, frame, atol=3)
+            conn.close()
+        self.assertEqual(self.request("/command/sample/secondary", "POST")[0], 200)
+        self.assertEqual(self.preview.poll_key(), -1)
+        self.assertEqual(secondary.poll_key(), ord("s"))
+        self.assertEqual(secondary.poll_key(), -1)
+        self.assertEqual(self.request("/command/sample/primary", "POST")[0], 200)
+        self.assertEqual(self.preview.poll_key(), ord("s"))
+        self.assertEqual(secondary.poll_key(), -1)
+        self.assertEqual(self.request("/stream/unknown.mjpg")[0], 404)
+        self.assertEqual(self.request("/command/sample/unknown", "POST")[0], 404)
+        self.assertEqual(self.request("/command/sample/secondary", "POST", token=False)[0], 403)
+        secondary.set_feedback(saved=3, target=20, message="sample saved")
+        state = json.loads(self.request("/status")[1])["channels"]
+        self.assertEqual(state["secondary"]["saved"], 3)
+        self.assertEqual(state["primary"]["saved"], 0)
+        secondary.allow_capture = self.preview.allow_capture = False
+        self.assertNotIn(b'data-capture="primary"', self.request("/")[1])
+        self.assertNotIn(b'data-capture="secondary"', self.request("/")[1])
+        self.assertEqual(self.request("/command/sample/secondary", "POST")[0], 404)
+        self.request("/command/quit", "POST")
+        self.assertEqual(secondary.poll_key(), ord("q"))
+
     def test_command_guards_and_latched_quit(self):
         self.assertEqual(self.request("/command/quit")[0], 404)
         self.assertEqual(self.request("/command/quit", "POST", token=False)[0], 403)

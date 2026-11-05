@@ -15,7 +15,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from algorithm.camera_stream import (CameraSettings, OrbbecColorStream, add_camera_arguments,
-    resolve_camera_arguments, validate_calibration, orbbec_frame_to_bgr, create_camera)
+    resolve_camera_arguments, validate_calibration, orbbec_frame_to_bgr, create_camera, paired_camera_settings)
 
 
 FORMATS = types.SimpleNamespace(**{v: v for v in
@@ -32,6 +32,7 @@ class CameraTests(unittest.TestCase):
 
     def test_terminal_selection_and_separate_paths(self):
         args = self.args()
+        args.camera = None  # Legacy interactive API remains available.
         with patch("sys.stdin.isatty", return_value=True), \
                 patch("builtins.input", side_effect=["bad", "2"]), \
                 contextlib.redirect_stdout(io.StringIO()):
@@ -40,10 +41,52 @@ class CameraTests(unittest.TestCase):
         self.assertIn("_orbbec_gemini305.json", args.intrinsics)
         self.assertIn("_orbbec_gemini305.json", args.hand_eye)
 
-    def test_noninteractive_requires_selection(self):
-        with patch("sys.stdin.isatty", return_value=False):
-            with self.assertRaisesRegex(ValueError, "--camera"):
-                resolve_camera_arguments(self.args())
+    def test_default_pair_and_eye_to_hand_paths(self):
+        args = self.args()
+        settings = resolve_camera_arguments(args)
+        self.assertEqual((settings.backend, settings.model), ("orbbec", "gemini305"))
+        secondary = paired_camera_settings(args)
+        self.assertEqual(secondary.model, "gemini335")
+        args = self.args()
+        args.mode = "eye_to_hand"
+        settings = resolve_camera_arguments(args)
+        self.assertEqual(settings.model, "gemini335")
+        self.assertIn("gemini335.json", args.intrinsics)
+        self.assertIn("gemini335.json", args.hand_eye)
+        args.single_camera = True
+        self.assertIsNone(paired_camera_settings(args))
+
+    def test_reject_other_orbbec_model_and_mount(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "calibration.json"
+            data = {"camera": {"backend": "orbbec", "model": "Orbbec Gemini 335"}}
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "型号"):
+                validate_calibration(path, CameraSettings("orbbec", model="gemini305"))
+            data["mode"] = "eye_in_hand"
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(ValueError, "安装方式"):
+                validate_calibration(path, CameraSettings("orbbec", model="gemini335"))
+
+    def test_335_is_selected_by_model_even_when_305_is_first(self):
+        ob, _ = self.sdk()
+        device305 = ob.Context.return_value.query_devices.return_value.get_device_by_index.return_value
+        device335 = Mock()
+        info = device335.get_device_info.return_value
+        info.get_name.return_value = "Orbbec Gemini 335"
+        info.get_serial_number.return_value = "B"
+        info.get_firmware_version.return_value = "1.4.60"
+        devices = ob.Context.return_value.query_devices.return_value
+        devices.get_count.return_value = 2
+        devices.get_device_by_index.side_effect = [device305, device335]
+        with patch.dict(sys.modules, pyorbbecsdk=ob), contextlib.redirect_stdout(io.StringIO()):
+            stream = OrbbecColorStream(model="gemini335")
+            try:
+                ob.Pipeline.assert_called_once_with(device335)
+                self.assertEqual(stream.metadata["role"], "eye_to_hand")
+                self.assertEqual(stream.metadata["serial"], "B")
+            finally:
+                stream.stop()
 
     def test_optional_hand_eye_and_explicit_paths(self):
         args = self.args(["--camera", "orbbec", "--intrinsics", "custom.json"])

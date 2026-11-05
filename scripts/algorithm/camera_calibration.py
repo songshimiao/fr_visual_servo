@@ -1,7 +1,7 @@
 """
 scripts/algorithm/camera_calibration.py
 
-RealSense / Orbbec Gemini 305 相机标定模块
+Gemini 305 eye-in-hand / Gemini 335 eye-to-hand 双相机标定模块（保留 RealSense）
 1. 内参标定: 使用 ChArUco 标定板 (cv2.aruco.calibrateCameraCharuco)
 2. 手眼标定: 支持 Eye-in-Hand (AX=XB) 与 Eye-to-Hand (AX=ZB), 标定结果保存为 json
 
@@ -27,6 +27,7 @@ RealSense / Orbbec Gemini 305 相机标定模块
 import argparse
 import json
 import time
+import threading
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -35,11 +36,13 @@ import numpy as np
 
 if __package__:
     from .camera_stream import (RealSenseColorStream, create_camera, add_camera_arguments,
-                                resolve_camera_arguments, validate_calibration)
+                                resolve_camera_arguments, validate_calibration, paired_camera_settings,
+                                calibration_path, camera_role)
     from .web_preview import WebPreview, add_web_arguments
 else:
     from camera_stream import (RealSenseColorStream, create_camera, add_camera_arguments,
-                               resolve_camera_arguments, validate_calibration)
+                               resolve_camera_arguments, validate_calibration, paired_camera_settings,
+                                calibration_path, camera_role)
     from web_preview import WebPreview, add_web_arguments
 
 
@@ -116,6 +119,7 @@ def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
     saved = 0
 
     print(f"[采集] 目标 {num_images} 张有效图像. 在网页中采集/结束 (s/q).")
+    preview.set_feedback(saved=0, target=num_images, message="等待保存 ChArUco 样本")
     while saved < num_images and not preview.stop_event.is_set():
         frame = camera.get_color_frame()
         if frame is None:
@@ -134,13 +138,18 @@ def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
         key = preview.poll_key()
 
         if key == ord('s') and ch_corners is not None:
+            if save_dir:
+                save_dir.mkdir(parents=True, exist_ok=True)
+                image_path = save_dir / f"charuco_{saved + 1:03d}.png"
+                if not cv2.imwrite(str(image_path), frame):
+                    raise RuntimeError(f"无法保存标定图像: {image_path}")
             all_corners.append(ch_corners)
             all_ids.append(ch_ids)
             saved += 1
-            if save_dir:
-                save_dir.mkdir(parents=True, exist_ok=True)
-                cv2.imwrite(str(save_dir / f"charuco_{saved:03d}.png"), frame)
+            preview.set_feedback(saved=saved, message="样本已保存")
             print(f"  已采集 {saved}/{num_images}")
+        elif key == ord('s'):
+            preview.set_feedback(message="未保存：未检测到足够的 ChArUco 角点")
         elif key == ord('q'):
             break
 
@@ -173,7 +182,7 @@ def calibrate_intrinsics(all_corners, all_ids, board, image_size) -> dict:
 
 
 # ----------------------------------------------------------
-# 2. 手眼标定 (Eye-in-Hand / Eye-to-Hand，运行时手动选择)
+# 2. 手眼标定 (305: Eye-in-Hand / 335: Eye-to-Hand)
 # ----------------------------------------------------------
 class RobotPoseProvider:
     """
@@ -233,6 +242,7 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
     print("       每次移动机械臂后，在网页中采集一帧(s)，或结束采集(q)。")
     print("       建议：姿态尽量覆盖不同的旋转方向，避免运动轨迹退化。")
 
+    preview.set_feedback(saved=0, target=num_poses, message="等待保存手眼样本；请先使机械臂静止")
     while saved < num_poses and not preview.stop_event.is_set():
         frame = camera.get_color_frame()
         if frame is None:
@@ -251,6 +261,7 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
 
         if key == ord('s'):
             if cam_T_target is None:
+                preview.set_feedback(message="未保存：未检测到标定板")
                 print("  [跳过] 未检测到标定板")
                 continue
             base_T_gripper = pose_provider.get_pose_matrix()
@@ -259,6 +270,7 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
             R_t2c.append(cam_T_target[:3, :3])
             t_t2c.append(cam_T_target[:3, 3])
             saved += 1
+            preview.set_feedback(saved=saved, message="图像位姿和当前法兰位姿已采集")
             print(f"  已采集 {saved}/{num_poses}")
         elif key == ord('q'):
             break
@@ -341,11 +353,121 @@ def load_intrinsics_for_cv(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return camera_matrix, dist_coeffs
 
 
+def run_dual_calibration(args, primary_settings, secondary_settings):
+    """Each camera owns its reader, samples, intrinsics and physical hand-eye mode.
+
+    The HTTP thread only signals requests. The acquisition worker reads the
+    current image/robot pose; cameras are independent and are not synchronized.
+    """
+    settings_list = [primary_settings, secondary_settings]
+    intrinsic_paths = [getattr(args, "intrinsics", None),
+                       calibration_path(secondary_settings.model)]
+    output_paths = [args.out, calibration_path(secondary_settings.model,
+                    "camera_intrinsics" if args.cmd == "intrinsic" else "hand_eye_calibration")]
+    if Path(output_paths[0]).resolve() == Path(output_paths[1]).resolve():
+        raise ValueError("两台相机的标定输出文件不能相同")
+    matrices = []
+    pose_provider = None
+    if args.cmd == "extrinsic":
+        for settings, path in zip(settings_list, intrinsic_paths):
+            validate_calibration(path, settings)
+            matrices.append(load_intrinsics_for_cv(Path(path)))
+        import sys
+        sys.path.append(str(Path(__file__).resolve().parents[1]))
+        from robot.fairino import Robot
+        from robot.fairino_robot import FairinoRobot
+        print(f"[connect] 读取机械臂 {args.ip} 的当前关节角（不下发运动）")
+        rpc = Robot.RPC(args.ip)
+        pose_lock = threading.Lock()
+
+        def get_joint_deg():
+            with pose_lock:
+                err, joints = rpc.GetActualJointPosDegree()
+            if err != 0:
+                raise RuntimeError(f"读取当前关节位置失败: {err}")
+            return joints
+
+        pose_provider = RobotPoseProvider(FairinoRobot(model_name=args.robot_model), get_joint_deg)
+        print("[安装约定] 305: 标定板相对基座固定；335: 标定板相对法兰固定。")
+        print("[采集] 两路样本独立保存；请按对应安装约定分别采集，不能混用板的固定方式。")
+
+    streams = []
+    errors = []
+    workers = []
+    completed = [threading.Event() for _ in settings_list]
+    with WebPreview.from_args(args, title="双相机标定", allow_capture=True) as preview:
+        try:
+            for index, settings in enumerate(settings_list):
+                paths = [intrinsic_paths[index]] if args.cmd == "extrinsic" else []
+                streams.append(create_camera(settings, paths))
+
+            def collect(index, channel):
+                camera = streams[index]
+                settings = settings_list[index]
+                try:
+                    board, dictionary = _make_charuco_board()
+                    if args.cmd == "intrinsic":
+                        root = Path(args.save_images_dir or "resources/intrinsics_img")
+                        save_dir = root / settings.model / (time.strftime("%Y%m%d_%H%M%S") + f"_{time.time_ns() % 1000000000:09d}")
+                        corners, ids, size = collect_charuco_images(
+                            camera, board, dictionary, args.num_images, save_dir, preview=channel)
+                        if len(corners) < 4:
+                            channel.set_feedback(message="有效样本不足 4 张，未写入标定文件")
+                            print(f"[{settings.model}] 有效样本不足，未写入标定文件")
+                            return
+                        result = calibrate_intrinsics(corners, ids, board, size)
+                    else:
+                        samples = collect_hand_eye_samples(
+                            camera, board, dictionary, *matrices[index], pose_provider,
+                            args.num_poses, preview=channel)
+                        if len(samples[0]) < 3:
+                            channel.set_feedback(message="有效样本不足 3 组，未写入标定文件")
+                            print(f"[{settings.model}] 有效样本不足，未写入标定文件")
+                            return
+                        result = calibrate_hand_eye(*samples, camera_role(settings.model))
+                    result["camera"] = camera.metadata
+                    save_json(result, Path(output_paths[index]))
+                    channel.set_feedback(message=f"标定完成：{output_paths[index]}")
+                except Exception as exc:
+                    errors.append(exc)
+                    channel.set_feedback(message=f"标定失败：{exc}")
+                    preview.stop_event.set()
+                finally:
+                    completed[index].set()
+                    # Keep the completed camera live while the other camera is
+                    # still collecting its independently mounted board.
+                    try:
+                        while not preview.stop_event.is_set() and not all(done.is_set() for done in completed):
+                            frame = camera.get_color_frame()
+                            if frame is not None:
+                                channel.publish(frame)
+                    except Exception as exc:
+                        errors.append(exc)
+                        channel.set_feedback(message=f"相机异常：{exc}")
+                        preview.stop_event.set()
+
+            for index, channel in enumerate(preview.channels.values()):
+                worker = threading.Thread(target=collect, args=(index, channel), daemon=True)
+                workers.append(worker)
+                worker.start()
+            while any(worker.is_alive() for worker in workers):
+                for worker in workers:
+                    worker.join(timeout=0.1)
+            if errors:
+                raise RuntimeError(f"双相机标定失败: {errors[0]}") from errors[0]
+        finally:
+            preview.stop_event.set()
+            for worker in workers:
+                worker.join()
+            for stream in streams:
+                stream.stop()
+
+
 # -------------
 # CLI
 # -------------
 def main():
-    parser = argparse.ArgumentParser(description="RealSense / Orbbec Gemini 305 相机标定")
+    parser = argparse.ArgumentParser(description="Gemini 305 eye-in-hand / Gemini 335 eye-to-hand 双相机标定")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p1 = sub.add_parser("intrinsic", help="内参标定")
@@ -358,7 +480,7 @@ def main():
     p2 = sub.add_parser("extrinsic", help="手眼标定 (手动选择 eye_in_hand / eye_to_hand)")
     add_web_arguments(p2)
     add_camera_arguments(p2)
-    p2.add_argument("--mode", choices=["eye_in_hand", "eye_to_hand"], required=True)
+    p2.add_argument("--mode", choices=["eye_in_hand", "eye_to_hand"], default=None)
     p2.add_argument("--num-poses", type=int, default=15)
     p2.add_argument("--intrinsics", type=str, default=None)
     p2.add_argument("--out", type=str, default=None)
@@ -367,6 +489,17 @@ def main():
 
     args = parser.parse_args()
     camera_settings = resolve_camera_arguments(args)
+    if (args.num_images if args.cmd == "intrinsic" else args.num_poses) < (4 if args.cmd == "intrinsic" else 3):
+        parser.error("内参至少 4 张图像；手眼至少 3 组位姿")
+    secondary_settings = paired_camera_settings(args)
+    if secondary_settings is not None:
+        run_dual_calibration(args, camera_settings, secondary_settings)
+        return
+    if args.cmd == "extrinsic" and args.mode is None:
+        if camera_settings.backend == "orbbec":
+            args.mode = camera_role(camera_settings.model)
+        else:
+            parser.error("RealSense 手眼标定需要 --mode")
     if args.cmd == "extrinsic":
         validate_calibration(args.intrinsics, camera_settings)
     board, aruco_dict = _make_charuco_board()

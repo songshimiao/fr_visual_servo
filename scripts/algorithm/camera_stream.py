@@ -21,6 +21,7 @@ class CameraSettings:
     height: int = 480
     fps: int = 30
     serial: str = None
+    model: str = None
 
 
 def positive_int(value):
@@ -31,8 +32,12 @@ def positive_int(value):
 
 
 def add_camera_arguments(parser):
-    parser.add_argument("--camera", choices=("realsense", "orbbec"), default=None,
-                        help="不指定时在终端选择；orbbec = Gemini 305")
+    parser.add_argument("--camera", choices=("realsense", "orbbec"), default="orbbec",
+                        help="默认 Orbbec 双相机：305 eye-in-hand / 335 eye-to-hand")
+    parser.add_argument("--camera-model", choices=("gemini305", "gemini335"), default=None,
+                        help="主相机型号；默认 gemini305，eye_to_hand 标定默认 gemini335")
+    parser.add_argument("--single-camera", action="store_true", help="仅打开所选主相机")
+    parser.add_argument("--secondary-camera-serial", default=None, help="另一台相机序列号")
     parser.add_argument("--camera-width", type=positive_int, default=640)
     parser.add_argument("--camera-height", type=positive_int, default=480)
     parser.add_argument("--camera-fps", type=positive_int, default=30)
@@ -53,7 +58,14 @@ def resolve_camera_arguments(args):
             if choice == "q":
                 raise SystemExit(0)
             print("无效选择，请输入 1 或 2")
-    suffix = "_orbbec_gemini305" if args.camera == "orbbec" else ""
+    model = getattr(args, "camera_model", None)
+    if args.camera == "orbbec":
+        model = model or ("gemini335" if getattr(args, "mode", None) == "eye_to_hand" else "gemini305")
+        args.camera_model = model
+        expected_mode = camera_role(model)
+        if getattr(args, "cmd", None) == "extrinsic" and getattr(args, "mode", None) not in (None, expected_mode):
+            raise ValueError(f"{model} 的安装方式固定为 {expected_mode}，与 --mode 不一致")
+    suffix = f"_orbbec_{model}" if args.camera == "orbbec" else ""
     defaults = {"intrinsics": f"resources/calibration/camera_intrinsics{suffix}.json",
                 "hand_eye": f"resources/calibration/hand_eye_calibration{suffix}.json",
                 "out": (f"resources/calibration/camera_intrinsics{suffix}.json"
@@ -66,9 +78,31 @@ def resolve_camera_arguments(args):
                 continue
             setattr(args, name, path)
     settings = CameraSettings(args.camera, args.camera_width, args.camera_height,
-                              args.camera_fps, args.camera_serial)
+                              args.camera_fps, args.camera_serial, model)
     print(f"[相机] {settings.backend} {settings.width}x{settings.height}@{settings.fps}")
     return settings
+
+
+def camera_role(model):
+    return {"gemini305": "eye_in_hand", "gemini335": "eye_to_hand"}[model]
+
+
+def camera_label(model):
+    return {"gemini305": "Gemini 305 · Eye-in-Hand（眼在手上）",
+            "gemini335": "Gemini 335 · Eye-to-Hand（眼在手外）"}[model]
+
+
+def paired_camera_settings(args):
+    """Primary settings must already have been resolved on the main thread."""
+    if args.camera != "orbbec" or getattr(args, "single_camera", False):
+        return None
+    model = "gemini335" if args.camera_model == "gemini305" else "gemini305"
+    return CameraSettings("orbbec", args.camera_width, args.camera_height,
+                          args.camera_fps, args.secondary_camera_serial, model)
+
+
+def calibration_path(model, kind="camera_intrinsics"):
+    return f"resources/calibration/{kind}_orbbec_{model}.json"
 
 
 def validate_calibration(path, settings, serial=None):
@@ -77,11 +111,20 @@ def validate_calibration(path, settings, serial=None):
     metadata = data.get("camera")
     if metadata is None:
         if settings.backend != "realsense":
-            raise ValueError(f"{path}: 缺少 camera 元数据，请为 Gemini 305 重新标定，不能复用 RealSense 参数")
+            raise ValueError(f"{path}: 缺少 camera 元数据，请为当前 Gemini 相机重新标定，不能复用 RealSense 参数")
         print(f"[标定] {path}: 旧版 RealSense 文件无相机标识，请确认相机和安装位置一致")
     else:
         if metadata["backend"] != settings.backend:
             raise ValueError(f"{path}: 标定相机类型与所选相机不一致")
+        if settings.backend == "orbbec" and settings.model:
+            expected_model = settings.model.removeprefix("gemini")
+            if expected_model not in metadata.get("model", ""):
+                raise ValueError(f"{path}: 标定相机型号与 {settings.model} 不一致")
+            role = metadata.get("role")
+            if role is not None and role != camera_role(settings.model):
+                raise ValueError(f"{path}: 标定相机安装方式不一致")
+            if data.get("mode") not in (None, camera_role(settings.model)):
+                raise ValueError(f"{path}: 手眼标定 mode 与相机安装方式不一致")
         expected_serial = serial or settings.serial
         if expected_serial and metadata.get("serial") != expected_serial:
             raise ValueError(f"{path}: 标定相机序列号与当前相机不一致")
@@ -166,11 +209,13 @@ def orbbec_frame_to_bgr(frame, formats):
 
 
 class OrbbecColorStream:
-    def __init__(self, width=640, height=480, fps=30, serial=None):
+    def __init__(self, width=640, height=480, fps=30, serial=None, model="gemini305"):
         try:
             import pyorbbecsdk as ob
         except ImportError as exc:
             raise RuntimeError("缺少 Orbbec SDK v2，请运行 bash scripts/setup_orbbec_jetson.sh") from exc
+        model_number = model.removeprefix("gemini")
+        self.model = model
         self.ob = ob
         self.context = ob.Context()
         devices = self.context.query_devices()
@@ -178,10 +223,10 @@ class OrbbecColorStream:
         for index in range(devices.get_count()):
             device = devices.get_device_by_index(index)
             info = device.get_device_info()
-            if "305" in info.get_name() and (serial is None or info.get_serial_number() == serial):
+            if model_number in info.get_name() and (serial is None or info.get_serial_number() == serial):
                 matches.append(device)
         if len(matches) != 1:
-            raise RuntimeError(f"找到 {len(matches)} 台匹配的 Gemini 305，请检查 USB/udev；多台时用 --camera-serial")
+            raise RuntimeError(f"找到 {len(matches)} 台匹配的 Gemini {model_number}，请检查 USB/udev；多台时用 --camera-serial")
         self.device = matches[0]
         info = self.device.get_device_info()
         self.pipeline = ob.Pipeline(self.device)
@@ -201,7 +246,7 @@ class OrbbecColorStream:
         if profile is None:
             options = ", ".join(f"{p.get_width()}x{p.get_height()}@{p.get_fps()} {p.get_format()}"
                                 for p in available)
-            raise RuntimeError(f"Gemini 305 不支持 {width}x{height}@{fps}；可用彩色流: {options}")
+            raise RuntimeError(f"Gemini {model_number} 不支持 {width}x{height}@{fps}；可用彩色流: {options}")
         cfg = ob.Config()
         cfg.enable_stream(profile)
         self.color_profile = profile
@@ -209,7 +254,7 @@ class OrbbecColorStream:
         self._running = True
         self._last_frame = time.monotonic()
         self.metadata = dict(backend="orbbec", model=info.get_name(),
-                             serial=info.get_serial_number(), firmware=info.get_firmware_version(),
+                             serial=info.get_serial_number(), role=camera_role(model), firmware=info.get_firmware_version(),
                              width=width, height=height, fps=fps, format=str(profile.get_format()))
         print(f"[Orbbec] {self.metadata}")
 
@@ -218,7 +263,7 @@ class OrbbecColorStream:
         color = frames.get_color_frame() if frames else None
         if not color:
             if time.monotonic() - self._last_frame > 5:
-                raise RuntimeError("Gemini 305 彩色流连续 5 秒无有效帧，请检查 USB 连接")
+                raise RuntimeError(f"{self.model} 彩色流连续 5 秒无有效帧，请检查 USB 连接")
             return None
         image = orbbec_frame_to_bgr(color, self.ob.OBFormat)
         self._last_frame = time.monotonic()
@@ -249,7 +294,8 @@ def create_camera(settings=None, calibration_paths=()):
     for path in calibration_paths:
         validate_calibration(path, settings)
     cls = {"realsense": RealSenseColorStream, "orbbec": OrbbecColorStream}[settings.backend]
-    stream = cls(settings.width, settings.height, settings.fps, settings.serial)
+    kwargs = {"model": settings.model or "gemini305"} if settings.backend == "orbbec" else {}
+    stream = cls(settings.width, settings.height, settings.fps, settings.serial, **kwargs)
     try:
         for path in calibration_paths:
             validate_calibration(path, settings, stream.metadata["serial"])

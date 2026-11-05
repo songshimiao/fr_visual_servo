@@ -4,7 +4,7 @@
 
 ## 系统概述
 
-本项目支持 Intel RealSense D435 和 Orbbec Gemini 305，相机入口启动时可在终端选择，能够：
+本项目默认使用 Orbbec 双相机：Gemini 305 为 eye-in-hand（眼在手上），Gemini 335 为 eye-to-hand（眼在手外），并保留 RealSense 单相机兼容入口。能够：
 - 实时检测 ArUco 标记板
 - 通过视觉伺服算法控制机器人末端精确跟随标记板
 - 支持"远距离跟随"和"近距离靠近"两种悬停模式
@@ -64,12 +64,47 @@ fr_visual_servo/
 
 ## 使用方法
 
+### 当前双相机配置（2026-11-05）
+
+默认启动两路彩色流，浏览器访问 **http://192.168.66.80:8080/**：
+
+| 相机 | 安装方式 | 当前序列号 | 用途 |
+|------|----------|------------|------|
+| Gemini 305 | eye-in-hand，眼在手上 | CV27864000EE | PBVS 主视觉、内参及手眼标定 |
+| Gemini 335 | eye-to-hand，眼在手外 | CP08863000Z7 | 外部监控、内参及手眼标定 |
+
+```bash
+# 同时预览两台相机，不连接机械臂
+python3 scripts/camera_preview.py
+
+# 双相机内参标定：每个画面下有独立的“保存当前样本”按钮
+python3 scripts/algorithm/camera_calibration.py intrinsic --num-images 20
+
+# 双相机手眼标定：仅读取关节角，分别保存两种安装方式的结果
+python3 scripts/algorithm/camera_calibration.py extrinsic --num-poses 15
+
+# 伺服作业：305 为主视觉，335 为监控；网页不显示保存按钮
+python3 scripts/main_pbvs.py
+```
+
+两台相机的内参和手眼文件分别使用 `_orbbec_gemini305.json`、
+`_orbbec_gemini335.json` 后缀。不会复用另一台相机的标定结果。
+305 手眼采集时标定板相对基座固定；335 手眼采集时标定板相对法兰固定，
+请按这两种约定分别采样。每路保存按钮只采集本路样本，页面显示各自进度和结果。
+两路不是硬件同步采集；采样时应使机械臂和标定板静止。
+
+默认按型号匹配，USB 枚举顺序改变不会交换角色。可用
+`--camera-serial` 和 `--secondary-camera-serial` 分别指定主/副相机。
+单相机使用 `--single-camera --camera-model gemini305` 或 `gemini335`；
+RealSense 使用 `--camera realsense`。同一时间只运行一个相机入口。
+详细行为及验证记录见 [双相机改动记录](readme/2026-11-05_8_dual_orbbec_cameras.md)。
+
 ### Jetson 无显示器远程监控
 
 相机入口默认启动网页视频流，不再创建 OpenCV 本地窗口。在 Jetson 项目根目录运行：
 
 ```bash
-# 终端选择 1=RealSense、2=Gemini 305；不连接机械臂
+# 默认 Gemini 305 主视觉 + Gemini 335 监控；不连接机械臂
 # marker-length 按实际边长设置（米）
 python3 scripts/algorithm/aruco_detector.py \
   --marker-length 0.05
@@ -79,14 +114,14 @@ python3 scripts/main_pbvs.py
 ```
 
 电脑浏览器访问 **http://192.168.66.80:8080/**。支持 `--web-port`、`--web-fps`、
-`--web-quality`、`--web-host` 和 `--no-web`。标定时在网页点击“采集一帧”或按 s；
+`--web-quality`、`--web-host` 和 `--no-web`。标定时在对应画面下点击“保存当前样本”（s 保存主相机）；
 网页 q/结束按钮触发原有退出流程，执行模式下可能包含回位动作，并非急停。
 机器人执行确认仍在 SSH 终端进行。服务用于可信局域网，也可通过 SSH 转发访问。
 
 完整命令、标定操作、退出行为及离线测试见
 [无显示器网页监控记录](readme/2026-10-21_5_headless_web_monitoring.md)。
 
-### 相机选择与 Gemini 305 环境
+### 相机选择与 Orbbec 环境
 
 在 Jetson 项目根目录执行。当前 Jetson 已安装 `pyorbbecsdk2==2.1.2`（底层 SDK 2.9.3）
 和 Orbbec USB udev 规则，原有 RealSense、OpenCV、NumPy 环境保留。
@@ -95,15 +130,15 @@ python3 scripts/main_pbvs.py
 ```bash
 bash scripts/setup_orbbec_jetson.sh
 
-# 不带 --camera 会在终端选择相机；网页地址仍为 http://192.168.66.80:8080/
+# 不带 --camera 默认打开 Orbbec 双相机；网页地址为 http://192.168.66.80:8080/
 python3 scripts/camera_preview.py
 python3 scripts/algorithm/aruco_detector.py --marker-length 0.05
 
-# 可直接指定；非交互运行时必须指定 --camera
+# 可直接指定后端；RealSense 使用单相机
 python3 scripts/algorithm/aruco_detector.py --camera orbbec --marker-length 0.05
 python3 scripts/algorithm/aruco_detector.py --camera realsense --marker-length 0.05
 
-# Gemini 实测内参标定：网页采集，自动输出到 Gemini 专用文件
+# 双 Gemini 内参标定：分别采集并输出各自文件
 python3 scripts/algorithm/camera_calibration.py intrinsic --camera orbbec \
   --num-images 20 --save-images-dir resources/intrinsics_img/orbbec_gemini305
 ```
@@ -117,7 +152,7 @@ Jetson 的 `spatialmath/roboticstoolbox` 机器人依赖现已安装，版本约
 `requirements-jetson.txt`；实际运动仍需在终端确认现场安全。
 
 彩色流默认为 `640×480@30`，支持 `--camera-width / --camera-height / --camera-fps`，
-多台同型号相机可用 `--camera-serial`。更换分辨率需要对应内参；不支持的 Orbbec 流配置
+多台同型号相机可用 `--camera-serial` / `--secondary-camera-serial`。更换分辨率需要对应内参；不支持的 Orbbec 流配置
 会列出可用配置，不自动缩放图像。详细安装过程、出厂内参导出、重新标定和实测结果见
 [Gemini 305 接入记录](readme/2026-10-21_6_orbbec_gemini305.md)。
 
@@ -140,8 +175,10 @@ python scripts/main_pbvs.py --intrinsics resources/calibration/camera_intrinsics
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--camera` | 终端选择 | `realsense` 或 `orbbec`；非交互必须指定 |
-| `--intrinsics` | 按相机选择 | RealSense 使用原文件；Gemini 使用 `_orbbec_gemini305.json` 后缀 |
+| `--camera` | `orbbec` | 默认 Gemini 双相机；`realsense` 保留单相机入口 |
+| `--camera-model` | `gemini305` | 主相机型号；335 为 eye-to-hand，305 为 eye-in-hand |
+| `--single-camera` | 关闭 | 仅打开主相机 |
+| `--intrinsics` | 按相机选择 | RealSense 使用原文件；Gemini 按型号使用 `_orbbec_gemini305.json` / `_orbbec_gemini335.json` 后缀 |
 | `--hand-eye` | 按相机选择 | PBVS/悬停按相机选择；独立 ArUco 默认不加载手眼 |
 | `--execute` | - | 实际下发运动指令（默认为dry-run模式） |
 | `--servo-hz` | 100.0 | 控制频率（Hz） |
@@ -169,7 +206,7 @@ python3 -m pip install --user -r requirements-jetson.txt
 
 ### 硬件需求
 - Fairino FR5 机器人
-- Intel RealSense D435 或 Orbbec Gemini 305 相机（USB 3）
+- Orbbec Gemini 305 + Gemini 335 相机（USB 3）；保留 Intel RealSense D435 兼容
 - 标定板（用于相机和手眼标定）
 
 ## 标定说明

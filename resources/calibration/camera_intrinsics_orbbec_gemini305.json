@@ -8,7 +8,8 @@
     "width": 640,
     "height": 480,
     "fps": 30,
-    "format": "OBFormat.BGR"
+    "format": "OBFormat.BGR",
+    "role": "eye_in_hand"
   },
   "image_size": [
     640,
