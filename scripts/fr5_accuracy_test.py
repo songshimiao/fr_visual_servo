@@ -1,3 +1,5 @@
+# 旧版模型/控制器一致性、重复定位和 tool1 定点旋转测试。
+# 这里比较 FK 与控制器反馈，不具备独立外部测量基准；阅读“精度”输出时需保留这个限制。
 """
 FR5 精度 / 重复定位精度测试
 ===============================
@@ -70,6 +72,7 @@ FIXED_POINT_RPY_OFFSETS_DEG = [
 FIXED_POINT_BASE_JOINT_DEG = [0, -90, 90, -90, -90, 0]
 
 
+# 控制器 [mm,deg] TCP → 米制 SE3，旋转顺序由 TCP_RPY_ORDER 决定。
 def tcp_pose_to_SE3(pose_mm_deg, order=TCP_RPY_ORDER):
     """把控制器反馈的 [x,y,z,rx,ry,rz] (mm, deg) 转成 SE3 (m)"""
     pose_mm_deg = np.asarray(pose_mm_deg, dtype=float)
@@ -79,6 +82,7 @@ def tcp_pose_to_SE3(pose_mm_deg, order=TCP_RPY_ORDER):
     return SE3(t[0], t[1], t[2]) * R
 
 
+# 用相对旋转迹计算夹角，输出度。
 def rotation_error_deg(T_model: SE3, T_actual: SE3) -> float:
     """计算两个位姿之间的旋转误差 (deg)"""
     R_err = T_model.R.T @ T_actual.R
@@ -87,13 +91,16 @@ def rotation_error_deg(T_model: SE3, T_actual: SE3) -> float:
     return float(np.degrees(np.arccos(cos_theta)))
 
 
+# 两位姿平移欧氏差，输出 mm。
 def translation_error_mm(T_model: SE3, T_actual: SE3) -> float:
     """计算两个位姿之间的平移误差 (mm)"""
     return float(np.linalg.norm(T_model.t - T_actual.t) * 1000.0)
 
 
+# 组合模型、控制器读数和可选 MoveJ 的测试器，不参与在线视觉跟随。
 class FairinoAccuracyTester:
     """封装 运动学模型 + 实机 SDK 的精度 / 重复定位精度测试逻辑"""
+    # 初始化模型和 RPC；dry_run 不会跳过连接，仅跳过运动发送。
     def __init__(self, ip: str = ROBOT_IP, dry_run: bool = True):
         self.dry_run = dry_run
         self.kinematics = FairinoRobot(model_name=MODEL_NAME)
@@ -104,6 +111,7 @@ class FairinoAccuracyTester:
 
 
     # 基础状态读取 / 使能控制
+    # 读取反馈角并转弧度，读取失败抛错。
     def get_actual_joint_rad(self) -> np.ndarray:
         err, joint_deg = self.robot.GetActualJointPosDegree()
         if err != 0:
@@ -111,6 +119,7 @@ class FairinoAccuracyTester:
         return np.deg2rad(np.asarray(joint_deg, dtype=float))
     
 
+    # 读取控制器 TCP，再按当前旋转顺序/单位约定转换。
     def get_actual_tcp_SE3(self) -> SE3:
         err, tcp = self.robot.GetActualTCPPose()
         if err != 0:
@@ -118,6 +127,7 @@ class FairinoAccuracyTester:
         return tcp_pose_to_SE3(tcp)
     
 
+    # 执行测试前切自动模式并请求使能。
     def enable(self):
         ret = self.robot.Mode(0)
         print(f"[enable] 切换自动模式.")
@@ -127,11 +137,13 @@ class FairinoAccuracyTester:
         time.sleep(0.5)
 
     
+    # 在执行流程结束时请求下使能。
     def disable(self):
         ret = self.robot.RobotEnable(0)
         print(f"[disable] 下使能.")
 
 
+    # 把度制目标转弧度后逐轴检查，任一超限返回 False。
     def _check_limits(self, q_deg):
         q_rad = np.deg2rad(np.asarray(q_deg, dtype=float))
         for i, q in enumerate(q_rad):
@@ -143,6 +155,7 @@ class FairinoAccuracyTester:
         return True
     
 
+    # 共用点位入口：先检查限位；dry-run 只打印 FK，执行时调用阻塞式 MoveJ 并等待停稳。
     def _move_j_deg(self, q_deg, label=""):
         """下发 MoveJ (阻塞式), dry-run 模式下只做限位检查和模型计算"""
         if not self._check_limits(q_deg):
@@ -165,6 +178,7 @@ class FairinoAccuracyTester:
     # ----------------------------------------
     # Test1: 绝对精度 
     # ----------------------------------------
+    # 按若干关节目标点比较模型 FK 与控制器 TCP，输出位置/姿态一致性统计。
     def test_accuracy(self, joint_configs_deg=None):
         """
         对一组关节空间目标点逐个运动, 比较:
@@ -223,6 +237,7 @@ class FairinoAccuracyTester:
     # -----------------------
     # Test2: 重复定位精度
     # -----------------------
+    # 每次经同一预备点逼近目标，统计反馈位置相对均值的散布及姿态相对首帧的差异。
     def test_repeatability(self, target_joint_deg=None, approach_joint_deg=None,
                             n_repeats: int = 10):
         """
@@ -290,6 +305,7 @@ class FairinoAccuracyTester:
     # Test3: 定点旋转 (保持 tool1 原点不变, 绕其自身轴转动)
     # ---------------------
 
+    # 固定 tool1 原点、改变其姿态，补偿回法兰求 IK，再对照到位后的中心偏移。
     def test_fixed_point_rotation(self, base_joint_deg=None, rpy_offsets_deg=None):
         """
         保持 tool1 坐标系原点(中心点)不变，在该点上叠加一系列绕 tool1 自身坐标轴的
@@ -400,6 +416,7 @@ class FairinoAccuracyTester:
 
         return results
 
+    # 适配模型的 reference_joint_pos 参数，求解失败返回 None。
     def _solve_ik(self, T_flange_target: SE3, q0=None):
         """
         逆运动学求解包装函数，对齐 FairinoRobot.inverse_kinematics 的实际签名:
@@ -412,6 +429,7 @@ class FairinoAccuracyTester:
         return np.asarray(q_sol, dtype=float)
 
 
+# 解析测试开关，执行模式经确认后使能；汇总结果可选写 JSON，finally 下使能。
 def main():
     parser = argparse.ArgumentParser(description="FR5 精度 / 重复定位精度测试脚本")
     parser.add_argument("--ip", default=ROBOT_IP, help="机械臂控制器 IP")

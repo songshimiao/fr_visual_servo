@@ -1,3 +1,5 @@
+# 一次性视觉悬停验证：先检测目标并计算 IK，再可选 MoveJ；它不是持续闭环 PBVS。
+# 此入口会读真实控制器；默认 dry-run 不下发运动，--execute 还需终端确认。
 """
 scripts/algorithm/visual_servo_hover_test.py
 
@@ -58,10 +60,12 @@ MOVE_VEL = 10.0
 MOVE_ACC = 0.0
 
 
+# 将 numpy 位姿包装为 SE3，保持米制平移。
 def np_to_SE3(T: np.ndarray) -> SE3:
     return SE3(T, check=False)
 
 
+# 要求连续多帧检出指定目标，返回最后一帧位姿；这里的“稳定”并未检验帧间几何方差。
 def wait_for_stable_marker(stream: RealSenseColorStream, dict_name: str,
                             marker_length: float, camera_matrix, dist_coeffs,
                             marker_id: Optional[int], stable_frames: int,
@@ -112,6 +116,7 @@ def wait_for_stable_marker(stream: RealSenseColorStream, dict_name: str,
     raise RuntimeError("[错误] 超时未能稳定检测到 marker，请检查标记是否在相机视野内")
 
 
+# 在目标 marker 系内设置悬停距离，按 look_down/match_marker/keep_current 选姿态，再补偿参考系偏置。
 def compute_target_flange_pose(base_T_flange_current: SE3, flange_T_cam: SE3,
                                 base_T_marker: SE3, hover_height: float,
                                 mode: str, orientation: str) -> SE3:
@@ -154,6 +159,8 @@ def compute_target_flange_pose(base_T_flange_current: SE3, flange_T_cam: SE3,
     return base_T_flange_target
 
 
+# 单次参考采集 → 当前关节 FK → 目标法兰 IK → 可选执行 → 用反馈 FK 评估到位偏差。
+# 参考来自同套视觉/运动学链，结果不等于外部独立仪器测得的绝对精度。
 def main():
     parser = argparse.ArgumentParser(description="ArUco悬停定位精度验证 (相机/tool1)")
     add_web_arguments(parser)
@@ -196,6 +203,7 @@ def main():
     kinematics_model = FairinoRobot(model_name=args.robot_model)
     print("[connect] 连接成功")
 
+    # 读取控制器角度并转弧度，SDK 非零返回码视为失败。
     def get_q_rad() -> np.ndarray:
         err, joint_deg = rpc_robot.GetActualJointPosDegree()
         if err != 0:
@@ -214,6 +222,7 @@ def main():
                 args.marker_id, args.stable_frames, preview=preview
             )
 
+            # 参考采集后独占主相机读帧，使等待确认和阻塞 MoveJ 时网页仍能刷新。
             def monitor():
                 # After reference capture this thread is the only camera reader.
                 # Keep the browser live while main waits for confirmation/MoveJ.

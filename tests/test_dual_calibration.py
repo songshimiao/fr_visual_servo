@@ -1,3 +1,4 @@
+# 双路标定编排回归：替换相机、采集器、求解器与 RPC，只验证线程/输出/安装角色隔离。
 """Exercise paired orchestration without opening cameras or moving a robot."""
 import argparse
 from contextlib import ExitStack, redirect_stdout
@@ -16,7 +17,9 @@ from algorithm import camera_calibration as calibration
 from algorithm.camera_stream import CameraSettings
 
 
+# 使用临时目录检查两路输出互不覆盖以及失败清理。
 class DualCalibrationTests(unittest.TestCase):
+    # 搭建完整替身环境后调用实际 run_dual_calibration，返回调用记录供断言。
     def run_pair(self, cmd, tmp, fail_second=False):
         args = argparse.Namespace(camera='orbbec', camera_model='gemini305',
             single_camera=False, secondary_camera_serial=None, camera_width=640,
@@ -29,10 +32,12 @@ class DualCalibrationTests(unittest.TestCase):
         cameras = [Mock(metadata={'model': s.model, 'role': role})
                    for s, role in zip(settings, ('eye_in_hand', 'eye_to_hand'))]
         records = []
+        # 假内参采集器返回 4 帧角点，同时记录各自预览通道。
         def collect(camera, *a, preview, **kw):
             preview.set_feedback(saved=4, target=4)
             records.append((camera, preview))
             return ([1] * 4, [2] * 4, (640, 480))
+        # 假手眼采集器返回 3 组配对，专门检验安装模式如何传到求解器。
         def collect_hand(camera, *a, preview, **kw):
             records.append((camera, preview))
             return ([np.eye(3)] * 3, [np.zeros(3)] * 3,
@@ -64,6 +69,7 @@ class DualCalibrationTests(unittest.TestCase):
                 calibration.run_dual_calibration(args, *settings)
         return cameras, records, solve
 
+    # 每路结果附上自己的设备身份，预览通道独立，最后两路都关闭。
     def test_each_camera_saves_own_intrinsics(self):
         with tempfile.TemporaryDirectory() as tmp:
             cameras, records, _ = self.run_pair('intrinsic', tmp)
@@ -77,6 +83,7 @@ class DualCalibrationTests(unittest.TestCase):
             for camera in cameras:
                 camera.stop.assert_called_once()
 
+    # 305 必须求 eye_in_hand，335 必须求 eye_to_hand，不能复用同一模式。
     def test_fixed_hand_eye_modes_are_never_shared(self):
         with tempfile.TemporaryDirectory() as tmp:
             cameras, records, solve = self.run_pair('extrinsic', tmp)
@@ -89,6 +96,7 @@ class DualCalibrationTests(unittest.TestCase):
             for camera in cameras:
                 camera.stop.assert_called_once()
 
+    # 第二台启动失败时释放第一台，不产生伪成功结果文件。
     def test_second_camera_start_failure_releases_first(self):
         with tempfile.TemporaryDirectory() as tmp:
             cameras, _, _ = self.run_pair('intrinsic', tmp, fail_second=True)

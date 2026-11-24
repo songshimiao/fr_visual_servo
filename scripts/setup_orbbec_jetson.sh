@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# Jetson 环境安装脚本，阅读与运行需区分：执行它会安装固定版本 SDK 并更新系统 udev 规则。
+# 只安装相机运行时且 --no-deps，避免连带改变现有 OpenCV/NumPy。
 # Install only the camera runtime; preserve the project's working OpenCV/NumPy.
 set -euo pipefail
 CAMERA_PYTHON="${CAMERA_PYTHON:-python3}"
@@ -14,6 +16,7 @@ if not hasattr(cv2, 'aruco'):
     raise SystemExit('当前 OpenCV 缺少 aruco，请使用工程已有的 opencv-contrib 环境')
 print('Python:', sys.version.split()[0], 'OpenCV:', cv2.__version__, 'NumPy:', numpy.__version__)
 PY
+# 默认用户级安装，若解释器已在虚拟环境中则去掉 --user。
 pip_scope=(--user)
 if "$CAMERA_PYTHON" -c 'import sys; sys.exit(sys.prefix == sys.base_prefix)'; then
     pip_scope=()  # A virtual environment must not use --user.
@@ -26,6 +29,7 @@ print(distribution('pyorbbecsdk2').locate_file('pyorbbecsdk/shared/99-obsensor-l
 PY
 )"
 test -f "$rules_path"
+# SDK 随带 USB 权限规则安装到系统目录；已有不同版本先备份，然后 reload/trigger。
 destination=/etc/udev/rules.d/99-obsensor-libusb.rules
 if [[ -f "$destination" ]] && ! cmp -s "$rules_path" "$destination"; then
     sudo cp -a "$destination" "${destination}.backup.$(date +%Y%m%d%H%M%S)"

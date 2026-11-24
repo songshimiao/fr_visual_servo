@@ -1,3 +1,6 @@
+# 本文件的入口内另封装了只读关节回调，供手眼/检测的 FK 适配器使用。
+# 旧版交互标定：内参采集 ChArUco 图像，手眼采集 camera_T_board 与 base_T_flange 配对。
+# 双相机各自采集/求解/保存；EIH 板固定在基座侧，ETH 板固定在法兰侧，采样需静止。
 """
 scripts/algorithm/camera_calibration.py
 
@@ -60,11 +63,13 @@ CHARUCO_MARKER_LENGTH = 0.011   # 单位: 米，ArUco 标记边长 (11mm)
 ARUCO_DICT_NAME = "DICT_4X4_50"
 
 
+# 按名称取得预定义 ArUco 字典。
 def _get_aruco_dict(name: str):
     dict_id = getattr(cv2.aruco, name)
     return cv2.aruco.getPredefinedDictionary(dict_id)
 
 
+# 兼容不同 OpenCV 版本构建 ChArUco 板；格长和标记尺寸由文件常量确定。
 def _make_charuco_board():
     """创建 ChArUco Board"""
     aruco_dict = _get_aruco_dict(ARUCO_DICT_NAME)
@@ -80,6 +85,7 @@ def _make_charuco_board():
     return board, aruco_dict
 
 
+# 检测 ArUco 后插值棋盘角点；不足时返回空结果供采集循环跳过。
 def _detect_charuco(gray, board, aruco_dict):
     """检测 ChArUco 角点, 返回 (charuco_corners, charuco_ids)"""
     if hasattr(cv2.aruco, "ArucoDetector"):
@@ -107,6 +113,7 @@ RealSenseCamera = RealSenseColorStream
 # -------------------------
 # 1. 内参标定
 # -------------------------
+# 网页保存请求只置事件，采集循环收到 s 后保存本路当前有效角点和图像。
 def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
                            num_images: int, save_dir: Optional[Path] = None, *, preview: WebPreview
                            ) -> Tuple[list, list, Tuple[int, int]]:
@@ -156,6 +163,7 @@ def collect_charuco_images(camera: RealSenseCamera, board, aruco_dict,
     return all_corners, all_ids, image_size
 
 
+# 用收集到的角点和编号执行 ChArUco 内参标定，输出 K/D 与像素误差。
 def calibrate_intrinsics(all_corners, all_ids, board, image_size) -> dict:
     """执行 ChArUco 内参标定, 返回内参结果字典"""
     ret, camera_matrix, dist_coeffs, rvecs, tvecs = cv2.aruco.calibrateCameraCharuco(
@@ -184,6 +192,7 @@ def calibrate_intrinsics(all_corners, all_ids, board, image_size) -> dict:
 # ----------------------------------------------------------
 # 2. 手眼标定 (305: Eye-in-Hand / 335: Eye-to-Hand)
 # ----------------------------------------------------------
+# 隔离 SDK 读取与运动学计算：只需要一个读取六轴角度的回调。
 class RobotPoseProvider:
     """
     机械臂末端位姿读取适配器。
@@ -194,10 +203,12 @@ class RobotPoseProvider:
     与现有 IK/FK 保持完全一致，不会因为重新实现正运动学引入误差或约定不一致。
     """
 
+    # 保存 FK 模型和读关节回调，不在构造器内使能或运动。
     def __init__(self, kinematics_model, get_joint_deg_fn: Callable[[], List[float]]):
         self.kinematics_model = kinematics_model
         self.get_joint_deg_fn = get_joint_deg_fn
 
+    # 度 → 弧度 → FK → base_T_flange 的 numpy 矩阵。
     def get_pose_matrix(self) -> np.ndarray:
         """返回 4x4 齐次变换矩阵: base_T_gripper (末端相对机器人基坐标系)"""
         q_deg = np.asarray(self.get_joint_deg_fn(), dtype=float)
@@ -206,6 +217,7 @@ class RobotPoseProvider:
         return np.asarray(se3_pose.A)
 
 
+# 从 ChArUco 检测求 camera_T_board；缺角点或求解失败返回 None。
 def estimate_target_pose_in_camera(gray, board, aruco_dict, camera_matrix, dist_coeffs
                                    ) -> Optional[np.ndarray]:
     """检测 ChArUco 角点并估计标定板相对相机的位姿, 返回 4x4 矩阵 cam_T_target"""
@@ -226,6 +238,7 @@ def estimate_target_pose_in_camera(gray, board, aruco_dict, camera_matrix, dist_
     return T
 
 
+# 每次保存把当前图像位姿与随后读取的法兰位姿配对；无硬件同步，需人工停稳。
 def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
                              camera_matrix, dist_coeffs,
                              pose_provider: RobotPoseProvider,
@@ -278,6 +291,8 @@ def collect_hand_eye_samples(camera: RealSenseCamera, board, aruco_dict,
     return R_g2b, t_g2b, R_t2c, t_t2c
 
 
+# EIH 输出 flange_T_camera；ETH 对机器人输入求逆后输出 base_T_camera。
+# 历史键 cam_T_gripper_or_base 命名与矩阵方向不符，应按 description 中 p_parent=T·p_cam 理解。
 def calibrate_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c, mode: str,
                        method=cv2.CALIB_HAND_EYE_TSAI) -> dict:
     """
@@ -334,6 +349,7 @@ def calibrate_hand_eye(R_g2b, t_g2b, R_t2c, t_t2c, mode: str,
 # --------------
 # JSON 读写工具
 # --------------
+# 创建父目录后保存 JSON；这里是旧版直接写文件，不具备新工程的原子替换/防覆盖语义。
 def save_json(data: dict, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
@@ -341,11 +357,13 @@ def save_json(data: dict, path: Path):
     print(f"[已保存] {path}")
 
 
+# 读取已有 JSON 字典。
 def load_json(path: Path) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
 
 
+# 把磁盘标定字段转换成 OpenCV 内参数组。
 def load_intrinsics_for_cv(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     data = load_json(path)
     camera_matrix = np.array(data["camera_matrix"], dtype=np.float64)
@@ -353,6 +371,7 @@ def load_intrinsics_for_cv(path: Path) -> Tuple[np.ndarray, np.ndarray]:
     return camera_matrix, dist_coeffs
 
 
+# 为两台相机分配独立输出和线程；一个完成后继续预览，等待另一台完成或全局退出。
 def run_dual_calibration(args, primary_settings, secondary_settings):
     """Each camera owns its reader, samples, intrinsics and physical hand-eye mode.
 
@@ -380,6 +399,7 @@ def run_dual_calibration(args, primary_settings, secondary_settings):
         rpc = Robot.RPC(args.ip)
         pose_lock = threading.Lock()
 
+        # 双路手眼读取共享 RPC 时加锁，避免两个采集线程同时访问同一连接。
         def get_joint_deg():
             with pose_lock:
                 err, joints = rpc.GetActualJointPosDegree()
@@ -401,6 +421,7 @@ def run_dual_calibration(args, primary_settings, secondary_settings):
                 paths = [intrinsic_paths[index]] if args.cmd == "extrinsic" else []
                 streams.append(create_camera(settings, paths))
 
+            # 单路采集 worker：按本型号的安装方式求解，附设备身份后写入本路结果。
             def collect(index, channel):
                 camera = streams[index]
                 settings = settings_list[index]
@@ -466,6 +487,7 @@ def run_dual_calibration(args, primary_settings, secondary_settings):
 # -------------
 # CLI
 # -------------
+# 按子命令启动内参或手眼工作流；双路配置走独立 worker，单路走原交互采集。
 def main():
     parser = argparse.ArgumentParser(description="Gemini 305 eye-in-hand / Gemini 335 eye-to-hand 双相机标定")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -531,6 +553,7 @@ def main():
             rpc_robot = Robot.RPC(args.ip)
             print("[connect] 连接成功")
 
+            # 读取当前六轴度制反馈，不下发运动；非零返回码抛错，由 RobotPoseProvider 再换算成米制法兰位姿。
             def get_joint_deg_fn() -> list:
                 err, joint_deg = rpc_robot.GetActualJointPosDegree()
                 if err != 0:

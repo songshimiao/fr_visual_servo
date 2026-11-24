@@ -1,3 +1,5 @@
+# 旧工程 PBVS 数学层；所有位置为米、角度为弧度，SE3 乘法表示坐标变换连乘。
+# 阅读顺序：PoseServoLaw（单拍位姿）→ PBVSController（IK）→ 悬停/滤波/静止检测/状态机。
 """
 scripts/algorithm/Pbvs.py
 
@@ -36,6 +38,7 @@ from spatialmath import SE3, SO3
 # 数值鲁棒性工具
 # =============
 
+# 通过 SVD 投影回 SO(3)，必要时翻转一列排除 det=-1 的反射矩阵。
 def fix_rotation_matrix(R: np.ndarray) -> np.ndarray:
     """
     修正旋转矩阵使其满足 SO(3) 约束(正交 + 行列式为+1)。
@@ -53,11 +56,13 @@ def fix_rotation_matrix(R: np.ndarray) -> np.ndarray:
     return R_fixed
 
 
+# 修正旋转后保留原平移，构造便于后续插值的 SE3。
 def _to_safe_SE3(T: SE3) -> SE3:
     """把 T.R 修正为合法旋转矩阵后, 重新组装成 SE3"""
     return SE3.Rt(fix_rotation_matrix(T.R), T.t, check=False)
 
 
+# 计算相对位姿误差大小，返回（米、弧度）。
 def pose_error_magnitudes(T_a: SE3, T_b: SE3) -> Tuple[float, float]:
     """
     计算两个位姿之间的误差大小: (位置误差模长[m], 姿态误差角度[rad])。
@@ -72,6 +77,7 @@ def pose_error_magnitudes(T_a: SE3, T_b: SE3) -> Tuple[float, float]:
     return position_error, rotation_error
 
 
+# 用旋转迹公式快速算夹角，clip 防止浮点误差使 arccos 超出定义域；这里不做 SVD。
 def _rotation_angle_fast(Ra: np.ndarray, Rb: np.ndarray) -> float:
     """
     计算两个旋转矩阵之间的夹角(rad), 用迹公式直接算, 不做 SVD 正交化修正。
@@ -89,6 +95,7 @@ def _rotation_angle_fast(Ra: np.ndarray, Rb: np.ndarray) -> float:
     return float(np.arccos(cos_theta))
 
 
+# 平移线性插值、旋转球面插值，两个系数可独立设置。
 def interp_pose(current: SE3, target: SE3, s_position: float, s_orientation: float) -> SE3:
     """
     在 current 与 target 之间插值: 平移线性插值, 旋转用 SO3.interp (球面插值)。
@@ -102,6 +109,7 @@ def interp_pose(current: SE3, target: SE3, s_position: float, s_orientation: flo
     return SE3.Rt(out_R, out_translation, check=False)
 
 
+# 把完整相对误差按比例缩小成单拍增量。
 def interp_pose_from_identity(end: SE3, s_position: float, s_orientation: float) -> SE3:
     """从单位位姿(Identity)插值到 end, 用于把"误差位姿"按比例缩小成"增量位姿" """
     return interp_pose(SE3(), end, s_position, s_orientation)
@@ -111,6 +119,7 @@ def interp_pose_from_identity(end: SE3, s_position: float, s_orientation: float)
 # 底层控制律: 插值式比例控制
 # ========================
 
+# 只算位姿增量；这里的 accel 参数是每次调用步长的增量上限，不是以秒计的物理加速度。
 class PoseServoLaw:
     """
     纯数学的位姿控制律: 输入(当前位姿, 期望位姿), 输出下一步应到达的位姿
@@ -137,6 +146,7 @@ class PoseServoLaw:
     RESULT_FINISHED = 1
     RESULT_ERROR_INVALID_INPUT = -1
 
+    # 保存增益、每拍最大位移/转角、可选工作空间和步长爬升限制。
     def __init__(
             self,
             kp: float = 0.3,
@@ -168,6 +178,7 @@ class PoseServoLaw:
         self._prev_translation_step_mag = 0.0
         self._prev_rotation_step_mag = 0.0
 
+    # 清空计数与上一拍步长，使启动或远近目标切换后重新平滑爬升。
     def reset(self):
         """
         重置内部状态。除了清零调用计数器, 也把"上一拍步长"归零, 让加速度限幅
@@ -179,6 +190,7 @@ class PoseServoLaw:
         self._prev_translation_step_mag = 0.0
         self._prev_rotation_step_mag = 0.0
 
+    # 将误差表达在当前本体系；比例控制后分别限制平移/转角，再限制步长增长。
     def _compute_increment(self, current_pose: SE3, desired_pose: SE3) -> Tuple[SE3, float, float]:
         """
         计算从 current_pose 走向 desired_pose 的增量位姿(在 current_pose 本体系下表达),
@@ -230,6 +242,7 @@ class PoseServoLaw:
             error_pose, kp_position, kp_orientation)
         return pose_incr, position_error, rotation_error
 
+    # 拒绝非有限输入，到阈值内返回 FINISHED；否则右乘增量，并把结果位置夹到工作空间。
     def step(self, current_pose: SE3, desired_pose: SE3) -> Tuple[int, SE3, float, float]:
         """
         执行一步 PBVS 控制。
@@ -264,6 +277,7 @@ class PoseServoLaw:
 
 # 向后兼容别名: PBVSGains 不再是必需的独立参数容器(PoseServoLaw 构造函数直接
 # 接收所有增益/限幅参数), 保留一个薄封装方便按名字传参/复用同一套参数。
+# 便于命名传参的数据容器；build 才创建有历史状态的控制律实例。
 @dataclass
 class PBVSGains:
     kp: float = 0.3
@@ -276,6 +290,7 @@ class PBVSGains:
     max_translation_accel: Optional[float] = None
     max_rotation_accel: Optional[float] = None
 
+    # 将所有配置字段传入 PoseServoLaw，调用者可复用配置但各自持有控制历史。
     def build(self) -> PoseServoLaw:
         return PoseServoLaw(
             kp=self.kp,
@@ -294,6 +309,7 @@ class PBVSGains:
 # 高层控制器: 组合控制律 + 运动学模型(FK/IK)
 # ======================================
 
+# 把单拍法兰位姿转换为关节目标；此类不下发 SDK，限位检查由上层处理。
 class PBVSController:
     """
     组合 PoseServoLaw 与机器人运动学模型(FairinoRobot 或任何实现了
@@ -303,12 +319,14 @@ class PBVSController:
     只要求鸭子类型(duck typing)满足接口即可, 方便测试时传入 mock 对象。
     """
 
+    # 优先使用显式 servo_law，否则从 gains 或默认值构造控制律。
     def __init__(self, kinematics_model, gains: Optional[PBVSGains] = None,
                  servo_law: Optional[PoseServoLaw] = None):
         self.kinematics_model = kinematics_model
         self.law = servo_law or (
             gains.build() if gains is not None else PoseServoLaw())
 
+    # 先走一拍位姿控制，再以 q_seed 为数值初值求 IK；失败返回 None 供入口跳过本拍。
     def compute_next_joint_target(
             self,
             base_T_flange_current: SE3,
@@ -338,6 +356,8 @@ class PBVSController:
 # ===========================================
 # 悬停目标位姿计算 (Z 轴对齐, 朝向随 marker 偏转)
 # ===========================================
+# 实际公式为 base_T_marker · Tz(+distance) · Rx(180°) · inverse(flange_T_ref)。
+# 这里沿旧版 marker 的 +Z 平移；ROS 新工程已转换目标轴向，不能直接混用两套正负号。
 def compute_hover_flange_pose(base_T_marker: SE3,
                               flange_T_ref: SE3,
                               hover_distance: float,
@@ -373,6 +393,7 @@ def compute_hover_flange_pose(base_T_marker: SE3,
 # ====================================
 # 位姿低通滤波 (可选, 用于平滑相机观测噪声)
 # ====================================
+# 对 SE3 做指数平滑，平移/旋转可设置不同系数；平滑越强，跟随滞后越大。
 class PoseExponentialFilter:
     """
     对 SE3 位姿序列做一阶低通滤波: 平移线性插值, 旋转用 SO3.interp 球面插值,
@@ -387,6 +408,7 @@ class PoseExponentialFilter:
     的关节抖动。因此姿态建议用比位置更强的平滑(更小的 alpha_rot)。
     """
 
+    # 校验两个 alpha∈(0,1]；内部状态在第一帧到来前为 None。
     def __init__(self, alpha: float = 0.4, alpha_rot: Optional[float] = None):
         if not (0.0 < alpha <= 1.0):
             raise ValueError("alpha 必须在 (0, 1] 之间")
@@ -396,9 +418,11 @@ class PoseExponentialFilter:
             raise ValueError("alpha_rot 必须在 (0, 1] 之间")
         self._state: Optional[SE3] = None
 
+    # 丢弃历史，或指定新的滤波初态。
     def reset(self, T_init: Optional[SE3] = None):
         self._state = T_init
 
+    # 首帧直接初始化，之后对“滤波态到原始态”的误差做插值更新。
     def update(self, T_raw: SE3) -> SE3:
         if self._state is None:
             self._state = _to_safe_SE3(T_raw)
@@ -409,6 +433,7 @@ class PoseExponentialFilter:
         self._state = self._state * pose_incr
         return self._state
 
+    # 只读访问当前滤波值，尚未输入观测时为 None。
     @property
     def value(self) -> Optional[SE3]:
         return self._state
@@ -418,6 +443,7 @@ class PoseExponentialFilter:
 # 循环时序监控 (诊断 ServoJ 实际发送间隔是否稳定)
 # ============================================================
 
+# 循环周期诊断器，只产生统计文字，不执行 watchdog 或停止动作。
 class LoopTimingMonitor:
     """
     统计控制循环的实际周期(dt), 用于诊断"是否偏离 ServoJ 要求的 60Hz~1000Hz
@@ -428,6 +454,7 @@ class LoopTimingMonitor:
     (最新/平均/最大 dt, 以及超出 [min_dt_ms, max_dt_ms] 区间的次数占比)。
     """
 
+    # 配置诊断周期范围（ms）和报告间隔（s），初始化采样窗口。
     def __init__(self, min_dt_ms: float = 1.0, max_dt_ms: float = 16.0,
                  report_every_s: float = 2.0):
         self.min_dt_ms = min_dt_ms
@@ -437,6 +464,7 @@ class LoopTimingMonitor:
         self._dts_ms: list = []
         self._last_report_t: Optional[float] = None
 
+    # 用单调时刻差统计周期，到报告间隔输出均值/最大值/超范围比例并清空本窗口。
     def tick(self, t: Optional[float] = None) -> Optional[str]:
         """
         记录一次循环时刻, 返回统计报告字符串(仅在到达 report_every_s 间隔时返回,
@@ -465,6 +493,7 @@ class LoopTimingMonitor:
 # 静止检测: 判断 marker 是否已连续静止超过指定时长
 # ===========================================
 
+# 滑动窗口判断位置 RMS 与相对转角 RMS，要求时间跨度足够且抑制异常帧。
 class MarkerStillnessDetector:
     """
     维护 marker 位姿的滑动时间窗口, 判断"标定板是否已连续静止 window_s 秒"。
@@ -485,6 +514,7 @@ class MarkerStillnessDetector:
     供上层打印诊断信息、依据实测数据设置阈值。
     """
 
+    # 设置窗口时长、静止阈值与异常跳变阈值；保存上次接受观测用于比较。
     def __init__(
         self,
         window_s: float = 3.0,
@@ -506,11 +536,13 @@ class MarkerStillnessDetector:
         self.last_pos_std_m: float = 0.0
         self.last_ang_std_deg: float = 0.0
 
+    # 清空窗口与静止判定历史，避免上个目标的样本影响新目标。
     def reset(self):
         self._buf.clear()
         self.last_pos_std_m = 0.0
         self.last_ang_std_deg = 0.0
 
+    # 更新窗口、过滤跳变，再用窗口位置均值和中间姿态估计噪声，返回是否静止。
     def update(self, t: float, base_T_marker: SE3) -> bool:
         """
         喂入一个新的 marker 观测(带时间戳), 返回当前是否判定为"静止"。
@@ -561,6 +593,7 @@ class MarkerStillnessDetector:
 
         return pos_std <= self.pos_thresh_m and ang_std_deg <= self.ang_thresh_deg
 
+    # 返回当前有效观测窗口覆盖时长，供界面显示静止检测进度。
     @property
     def buffer_span_s(self) -> float:
         window_samples = [(ts, T) for ts, T in self._buf if self._buf and (
@@ -574,6 +607,7 @@ class MarkerStillnessDetector:
 # 悬停状态机 (带滞回 + 停留时间, 防止远近悬停距离反复横跳)
 # ============================================================
 
+# 远距 TRACKING 与近距 APPROACHING 两态；最小驻留时间和恢复阈值减少反复切换。
 class HoverStateMachine:
     """
     TRACKING(远距离跟随) <-> APPROACHING(靠近) 状态切换, 带滞回(hysteresis)
@@ -594,6 +628,7 @@ class HoverStateMachine:
     TRACKING = "TRACKING"
     APPROACHING = "APPROACHING"
 
+    # 记录恢复跟随阈值，进入 APPROACHING 时将冻结当前板位姿作为运动判据。
     def __init__(
         self,
         resume_pos_thresh_m: float,
@@ -607,11 +642,13 @@ class HoverStateMachine:
         self._state_change_t: Optional[float] = None
         self._reference_pose: Optional[SE3] = None
 
+    # 回到远距 TRACKING，并清除先前靠近阶段的参考位姿。
     def reset(self):
         self.state = self.TRACKING
         self._state_change_t = None
         self._reference_pose = None
 
+    # 静止且满足驻留时间才靠近；目标偏离靠近参考超过阈值后返回远距跟随。
     def update(self, t: float, is_still: bool, base_T_marker: SE3) -> str:
         """
         :param t: 时间戳(s), 建议 time.monotonic()

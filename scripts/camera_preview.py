@@ -1,3 +1,4 @@
+# 只连接相机的入口：原图网页预览、有限帧采集自检、出厂内参导出。
 """Raw color preview / finite smoke test / factory intrinsics export. No robot imports."""
 import argparse
 import json
@@ -8,6 +9,7 @@ from algorithm.camera_stream import add_camera_arguments, resolve_camera_argumen
 from algorithm.web_preview import WebPreview, add_web_arguments
 
 
+# 解析相机/网页参数，按需以独占创建模式导出内参；退出时始终关闭主相机流。
 def main():
     parser = argparse.ArgumentParser(description="双相机彩色采集自检和网页预览（不连接机械臂）")
     add_camera_arguments(parser)

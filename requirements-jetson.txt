@@ -1,6 +1,7 @@
 # Tested on Jetson Ubuntu 22.04 / Python 3.10, RealSense + Fairino PBVS.
 # Keep NumPy 1.x for the installed OpenCV binary ABI.
 # pgraph-python 1.0.0 requires NumPy >=2; constrain this RTB dependency too.
+# Jetson 已验证依赖约束，优先保持 NumPy/OpenCV 二进制兼容，不在阅读代码时自动升级。
 numpy==1.26.4
 pgraph-python==0.6.5
 opencv-contrib-python==4.10.0.84

@@ -1,3 +1,5 @@
+# 共用相机抽象：各入口只调用 create_camera/get_frame/stop，不直接依赖某一种 SDK。
+# 光学系 x 向右、y 向下、z 向前；采集仅彩色，不在这里提供对齐深度。
 """Color-only camera adapters. Images are owned uint8 BGR arrays, never resized.
 
 Camera optical frame: x right, y down, z forward; PnP translation remains metres.
@@ -14,6 +16,7 @@ import cv2
 import numpy as np
 
 
+# 不可变采集配置；backend 选驱动，model/serial 定设备，width/height/fps 必须与标定匹配。
 @dataclass(frozen=True)
 class CameraSettings:
     backend: str = "realsense"
@@ -24,6 +27,7 @@ class CameraSettings:
     model: str = None
 
 
+# argparse 的正整数转换器，用于阻止零或负的图像尺寸/帧率。
 def positive_int(value):
     value = int(value)
     if value <= 0:
@@ -31,6 +35,7 @@ def positive_int(value):
     return value
 
 
+# 为各入口添加统一的主/副相机、分辨率、帧率和单相机命令行参数。
 def add_camera_arguments(parser):
     parser.add_argument("--camera", choices=("realsense", "orbbec"), default="orbbec",
                         help="默认 Orbbec 双相机：305 eye-in-hand / 335 eye-to-hand")
@@ -44,6 +49,7 @@ def add_camera_arguments(parser):
     parser.add_argument("--camera-serial", default=None, help="指定相机序列号")
 
 
+# 主线程解析相机型号与专属标定路径，保留显式路径；305 固定 EIH、335 固定 ETH。
 def resolve_camera_arguments(args):
     """Run on the main thread, before connecting a robot or starting workers."""
     if args.camera is None:
@@ -83,15 +89,18 @@ def resolve_camera_arguments(args):
     return settings
 
 
+# 把型号映射为物理安装角色；角色影响手眼公式，不能仅按 USB 枚举顺序决定。
 def camera_role(model):
     return {"gemini305": "eye_in_hand", "gemini335": "eye_to_hand"}[model]
 
 
+# 返回用于终端和网页的中文设备名称。
 def camera_label(model):
     return {"gemini305": "Gemini 305 · Eye-in-Hand（眼在手上）",
             "gemini335": "Gemini 335 · Eye-to-Hand（眼在手外）"}[model]
 
 
+# Orbbec 双路时派生另一型号配置；RealSense 或 --single-camera 返回 None。
 def paired_camera_settings(args):
     """Primary settings must already have been resolved on the main thread."""
     if args.camera != "orbbec" or getattr(args, "single_camera", False):
@@ -101,10 +110,12 @@ def paired_camera_settings(args):
                           args.camera_fps, args.secondary_camera_serial, model)
 
 
+# 按型号生成独立结果路径，防止 305、335 覆盖对方标定。
 def calibration_path(model, kind="camera_intrinsics"):
     return f"resources/calibration/{kind}_orbbec_{model}.json"
 
 
+# 打开硬件前检查类型/尺寸，连接后再检查实际序列号；仅保留旧 RealSense 无元数据兼容。
 def validate_calibration(path, settings, serial=None):
     """Keep legacy RealSense JSON usable; new Orbbec files must identify the camera."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
@@ -134,7 +145,9 @@ def validate_calibration(path, settings, serial=None):
     return data
 
 
+# RealSense 彩色流适配器；对外统一返回拥有独立内存的 uint8 BGR 图像。
 class RealSenseColorStream:
+    # 按所选配置启动彩色流，只在选中此后端时导入 RealSense SDK。
     def __init__(self, width=640, height=480, fps=30, serial=None):
         try:
             import pyrealsense2 as rs
@@ -152,6 +165,7 @@ class RealSenseColorStream:
                          self.profile.get_device().get_info(rs.camera_info.serial_number),
                          "width": width, "height": height, "fps": fps}
 
+    # 等待彩色帧并复制 SDK 缓冲；连续无帧超过 5 s 抛错。
     def get_frame(self):
         color = self.pipeline.wait_for_frames(timeout_ms=2000).get_color_frame()
         if not color:
@@ -161,27 +175,32 @@ class RealSenseColorStream:
         self._last_frame = time.monotonic()
         return np.asanyarray(color.get_data()).copy()
 
+    # 旧标定入口的兼容别名，行为与 get_frame 相同。
     def get_color_frame(self):
         return self.get_frame()
 
+    # 读取当前彩色流的出厂内参及 SDK 畸变模型名称。
     def get_rs_intrinsics(self):
         import pyrealsense2 as rs
         intr = self.profile.get_stream(rs.stream.color).as_video_stream_profile().get_intrinsics()
         return dict(width=intr.width, height=intr.height, fx=intr.fx, fy=intr.fy,
                     cx=intr.ppx, cy=intr.ppy, dist_coeffs=list(intr.coeffs), model=str(intr.model))
 
+    # 拒绝不能直接按 OpenCV 使用的畸变模型，再转成统一 JSON 结构。
     def get_factory_intrinsics(self):
         intr = self.get_rs_intrinsics()
         if "inverse_brown" in intr["model"] or "kannala" in intr["model"]:
             raise ValueError("该 RealSense 畸变模型需专门转换，请使用 ChArUco 标定")
         return _intrinsics_json(intr, self.metadata)
 
+    # 幂等停止采集管线，重复清理时不再次调用 SDK stop。
     def stop(self):
         if self._running:
             self._running = False
             self.pipeline.stop()
 
 
+# 按 MJPEG/RGB/BGR/多种 YUV 格式解码，核对尺寸后复制，防止下一帧覆盖 SDK 缓冲。
 def orbbec_frame_to_bgr(frame, formats):
     w, h, fmt = frame.get_width(), frame.get_height(), frame.get_format()
     data = np.frombuffer(frame.get_data(), dtype=np.uint8)
@@ -208,7 +227,9 @@ def orbbec_frame_to_bgr(frame, formats):
     return image.copy()
 
 
+# Orbbec 彩色流适配器：按型号和可选序列号选设备，要求唯一匹配。
 class OrbbecColorStream:
+    # 只在指定尺寸和帧率下选择支持的颜色格式；不静默缩放图像或改变已标定几何。
     def __init__(self, width=640, height=480, fps=30, serial=None, model="gemini305"):
         try:
             import pyorbbecsdk as ob
@@ -258,6 +279,7 @@ class OrbbecColorStream:
                              width=width, height=height, fps=fps, format=str(profile.get_format()))
         print(f"[Orbbec] {self.metadata}")
 
+    # 等待图像、转换 BGR，连续 5 s 无有效彩色帧则报告 USB/采集异常。
     def get_frame(self):
         frames = self.pipeline.wait_for_frames(1000)
         color = frames.get_color_frame() if frames else None
@@ -269,9 +291,11 @@ class OrbbecColorStream:
         self._last_frame = time.monotonic()
         return image
 
+    # 为旧采集函数保留 get_color_frame 名称。
     def get_color_frame(self):
         return self.get_frame()
 
+    # 按 OpenCV 的 k1,k2,p1,p2,k3,k4,k5,k6 顺序重排 SDK 畸变系数。
     def get_factory_intrinsics(self):
         intr = self.color_profile.get_intrinsic()
         dist = self.color_profile.get_distortion()
@@ -282,12 +306,14 @@ class OrbbecColorStream:
                                    dist.k3, dist.k4, dist.k5, dist.k6])
         return _intrinsics_json(values, self.metadata)
 
+    # 幂等关闭本相机管线。
     def stop(self):
         if self._running:
             self._running = False
             self.pipeline.stop()
 
 
+# 两阶段校验：开机前检查文件配置，开机后核对真实序列号；后验失败则先停流再抛错。
 def create_camera(settings=None, calibration_paths=()):
     settings = settings or CameraSettings()
     # Fail before opening hardware when calibration belongs to another backend/size.
@@ -305,6 +331,7 @@ def create_camera(settings=None, calibration_paths=()):
     return stream
 
 
+# 统一导出 K、畸变、尺寸和设备身份；source=factory_sdk 只表明出厂来源，不等于现场精度验证。
 def _intrinsics_json(intr, metadata):
     return {"source": "factory_sdk", "camera": dict(metadata),
             "image_size": [intr["width"], intr["height"]],

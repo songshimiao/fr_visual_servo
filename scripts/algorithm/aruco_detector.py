@@ -1,3 +1,6 @@
+# 本文件的入口内另封装了只读关节回调，供手眼/检测的 FK 适配器使用。
+# 旧版标记检测入口及工具；输出 camera_T_marker，标记边长必须以米给出。
+# 注意旧手眼 JSON 字段名有历史方向歧义，阅读时以实际矩阵连乘和标定 description 为准。
 """
 scripts/algorithm/aruco_detector.py
 
@@ -36,6 +39,7 @@ else:
     from web_preview import WebPreview, add_web_arguments
 
 
+# 按字典名称兼容创建 OpenCV 检测器，支持不同 aruco API 版本。
 def _get_aruco_detector(dict_name: str):
     dict_id = getattr(cv2.aruco, dict_name)
     aruco_dict = cv2.aruco.getPredefinedDictionary(dict_id)
@@ -47,6 +51,7 @@ def _get_aruco_detector(dict_name: str):
         print(f"[OpenCV] 版本过低, OpenCV >= 4.7")
 
 
+# 从 JSON 读取 K/D，转换成 OpenCV 使用的浮点数组。
 def load_camera_intrinsics(path: Path):
     with open(path, "r", encoding="utf-8") as f:
         data = json.load(f)
@@ -55,6 +60,7 @@ def load_camera_intrinsics(path: Path):
     return camera_matrix, dist_coeffs
 
 
+# 读取历史字段为 T，并保留 eye_in_hand/eye_to_hand 模式供后续变换分支选择。
 def load_hand_eye(path: Optional[Path]):
     """加载手眼标定结果，自动读取标定时选择的 mode (eye_in_hand / eye_to_hand)"""
     if path is None:
@@ -65,6 +71,7 @@ def load_hand_eye(path: Optional[Path]):
     return {"mode": data["mode"], "T": T}
 
 
+# 按 OpenCV 版本使用 ArucoDetector 或旧函数，返回角点与 ID。
 def detect_markers(gray, dict_name: str):
     """检测 ArUco 标记，返回 (corners, ids)"""
     if hasattr(cv2.aruco, "ArucoDetector"):
@@ -76,6 +83,7 @@ def detect_markers(gray, dict_name: str):
     return corners, ids
 
 
+# 按规定角点顺序生成米制正方形，对每个检测求单个 IPPE_SQUARE 位姿。
 def estimate_marker_poses(corners, marker_length, camera_matrix, dist_coeffs) -> list:
     """
     估计每个 marker 相对相机的位姿 (使用 solvePnP, 兼容各 OpenCV 版本，
@@ -108,6 +116,8 @@ def estimate_marker_poses(corners, marker_length, camera_matrix, dist_coeffs) ->
     return poses
 
 
+# 保留旧版候选时序比较流程；当前代码两次调用相同单解 API，不保证取得两个不同 PnP 解。
+# 真正枚举候选并检查歧义的实现可对照 ROS 工程 board.planar_pose。
 def estimate_marker_poses_robust(corners, marker_length, camera_matrix, dist_coeffs, 
                                 prev_poses: Optional[List[np.ndarray]] = None) -> List[np.ndarray]:
     """
@@ -171,6 +181,8 @@ def estimate_marker_poses_robust(corners, marker_length, camera_matrix, dist_coe
     return poses
 
 
+# EIH 分支实际连乘 base_T_gripper · T · camera_T_marker；ETH 分支实际使用 inverse(T)。
+# 注意当前 calibrate_hand_eye 的 ETH 输出 description 定义 T=base_T_camera，这与此处求逆存在方向不一致。
 def transform_pose(cam_T_marker: np.ndarray, hand_eye: Optional[dict],
                     base_T_gripper: Optional[np.ndarray] = None) -> Optional[np.ndarray]:
     """
@@ -197,12 +209,14 @@ def transform_pose(cam_T_marker: np.ndarray, hand_eye: Optional[dict],
     return None
 
 
+# 把相机系位姿转换为 rvec/tvec，在传入图像上原地绘制坐标轴。
 def draw_axis(frame, camera_matrix, dist_coeffs, T: np.ndarray, length=0.03):
     rvec, _ = cv2.Rodrigues(T[:3, :3])
     tvec = T[:3, 3]
     cv2.drawFrameAxes(frame, camera_matrix, dist_coeffs, rvec, tvec, length)
 
 
+# 循环采集、检测、显示；可选手眼时才换算基座系，退出时关闭相机。
 def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
                 hand_eye: Optional[dict] = None, pose_provider=None, *, preview: WebPreview,
                 camera_settings=None, calibration_paths=()):
@@ -248,6 +262,7 @@ def run_stream(camera_matrix, dist_coeffs, marker_length, dict_name,
         stream.stop()
 
 
+# 统一解析相机/网页/标记参数，手眼可选；未要求基座位姿时无需连接机器人。
 def main():
     parser = argparse.ArgumentParser(description="RealSense / Orbbec ArUco 坐标系检测")
     add_web_arguments(parser)
@@ -288,6 +303,7 @@ def main():
         rpc_robot = Robot.RPC(args.ip)
         print("[connect] 连接成功")
 
+        # 读取当前六轴度制反馈，不下发运动；非零返回码抛错，由 RobotPoseProvider 再换算成米制法兰位姿。
         def get_joint_deg_fn() -> list:
             err, joint_deg = rpc_robot.GetActualJointPosDegree()
             if err != 0:

@@ -1,3 +1,5 @@
+# 连接与实机诊断入口：模型 FK 对照、单轴小步、复位及关节符号扫描。
+# 默认 dry-run 仍读取控制器反馈；运动只在执行分支与终端确认后进行。
 """
 FR5 实机测试脚本
 =================
@@ -46,17 +48,21 @@ MOVE_VEL = 10.0              # MoveJ 速度百分比 [0~100]，测试阶段建�
 MOVE_ACC = 0.0               # MoveJ 加速度百分比，SDK 暂未开放，保留默认值
 
 
+# SDK/配置的度 → 模型弧度。
 def deg2rad(v):
     return np.deg2rad(v)
 
 
+# 模型弧度 → SDK 的度。
 def rad2deg(v):
     return np.rad2deg(v)
 
 
+# 把离线运动学模型与实际 SDK 状态读写组合成诊断流程。
 class FairinoHardwareTester:
     """封装 运动学模型 + 实机 SDK 的联合测试逻辑"""
 
+    # 建立模型与 RPC 连接，保存 dry_run 开关和关节限位。
     def __init__(self, ip: str = ROBOT_IP, dry_run: bool = True):
         self.dry_run = dry_run
 
@@ -74,6 +80,7 @@ class FairinoHardwareTester:
     # 基础状态读取 / 使能控制
     # ---------------------
 
+    # 读取六轴真实角度，换算弧度。
     def get_actual_joint_rad(self) -> np.ndarray:
         """读取控制器反馈的实际关节角 (deg -> rad)"""
         err, joint_deg = self.robot.GetActualJointPosDegree()
@@ -81,6 +88,7 @@ class FairinoHardwareTester:
             raise RuntimeError(f"读取当前关节位置失败, 错误码: {err}")
         return deg2rad(np.array(joint_deg, dtype=float))
 
+    # 切自动模式后上使能，并留出控制器响应时间。
     def enable(self):
         """切自动模式并上使能"""
         ret = self.robot.Mode(0)  # 0 - 自动运行模式
@@ -90,6 +98,7 @@ class FairinoHardwareTester:
         print(f"[enable] 上使能, ret={ret}")
         time.sleep(0.5)
 
+    # 退出流程请求下使能；SDK 返回值由此处打印以便现场核对。
     def disable(self):
         """下使能 (测试结束/异常时调用，保证机械臂进入安全状态)"""
         ret = self.robot.RobotEnable(0)
@@ -99,6 +108,7 @@ class FairinoHardwareTester:
     # 测试用例
     # ---------------------
  
+    # 用同一组反馈关节做 FK，并与控制器 TCP 对照；需保持 tool0/tool1 偏置约定一致。
     def test_connection_and_fk(self):
         """测试1: 读取实际关节角，并与运动学模型的正运动学结果做对比"""
         print("\n===== 测试1: 连接 & 正运动学校验 =====")
@@ -136,6 +146,7 @@ class FairinoHardwareTester:
         except AttributeError:
             pass
  
+    # 对指定轴叠加小角度，检查限位并计算轨迹；执行分支才发送 MoveJ。
     def test_small_joint_move(self, joint_index: int = 5, delta_deg: float = 5.0):
         """测试2: 单关节小幅度运动 (自有轨迹规划 + 实机 MoveJ 执行)"""
         print(f"\n===== 测试2: 关节 J{joint_index + 1} 小幅度运动 (+{delta_deg}°) =====")
@@ -172,6 +183,7 @@ class FairinoHardwareTester:
         q_after = self.get_actual_joint_rad()
         print(f"运动后实际关节角 (deg): {np.round(rad2deg(q_after), 2)}")
  
+    # 检查预设复位角后，按 dry_run 分别打印或发送运动。
     def test_return_home(self, q_home_deg=None):
         """测试3: 返回预设安全位姿"""
         print("\n===== 测试3: 返回安全位姿 =====")
@@ -187,6 +199,7 @@ class FairinoHardwareTester:
                                 vel=MOVE_VEL, acc=MOVE_ACC, blendT=-1.0)
         print(f"MoveJ 返回码: {ret}")
  
+    # 逐轴扫描正角度并对照 TCP/FK，定位轴向或 MDH 约定差异；执行会产生多次运动。
     def diagnose_joint_sign_convention(self, test_angle_deg: float = 30.0,
                                         settle_time: float = 1.0):
         """
@@ -249,6 +262,7 @@ class FairinoHardwareTester:
               "哪个关节的位移方向/角度符号明显不一致，就说明该关节的 "
               "theta_offset 或旋转方向与实机定义相反。")
 
+# 先做反馈/FK 检查，再按参数选小步或扫描；执行模式 finally 请求下使能。
 def main():
     parser = argparse.ArgumentParser(description="FR5 实机测试脚本")
     parser.add_argument("--ip", default=ROBOT_IP, help="机械臂控制器 IP")

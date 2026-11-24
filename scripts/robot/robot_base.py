@@ -1,3 +1,5 @@
+# 机器人模型抽象接口与类型约定：关节用弧度、SE3 平移用米。
+# 接口中的 move 指“计算轨迹”；实体 SDK 命令位于上层入口，不由本抽象类发送。
 import abc
 import numpy as np
 from typing import Optional, List, Tuple, Union
@@ -12,11 +14,13 @@ Pose = SE3                                  # 位姿(空间坐标系)
 JointTrajectory = List[JointPos]
 PoseTrajectory = List[Pose]
 
+# 定义所有模型必须实现的 FK、IK、关节轨迹与任务空间轨迹接口。
 class RobotBase(abc.ABC):
     """
     机器人基类, 定义工业机器人/协作机器人的核心接口
     """
 
+    # 保存型号/自由度，状态字段留给具体模型初始化。
     def __init__(self, model_name: str = "unknown_robot", degree_of_freedom: int = 6):
         """
         初始化机器人基类
@@ -31,6 +35,7 @@ class RobotBase(abc.ABC):
         self._joint_limits:List[JointLimit] = None  # 关节限制(最小值, 最大值)
 
     
+    # 约定：六轴关节角 → 基座到法兰的位姿。
     @abc.abstractmethod
     def forward_kinematics(self, joint_pos: JointPos) -> Pose:
         """
@@ -41,6 +46,7 @@ class RobotBase(abc.ABC):
         pass
 
 
+    # 约定：目标位姿与参考角 → 一组关节角；无法求解时可返回 None。
     @abc.abstractmethod
     def inverse_kinematics(self, target_pose: Pose, 
                            reference_joint_pose: Optional[JointPos] = None) -> Optional[JointPos]:
@@ -53,6 +59,7 @@ class RobotBase(abc.ABC):
         pass
 
     
+    # 约定：给定起终角与速度/加速度，返回离散关节位置序列。
     @abc.abstractmethod
     def move_joint_space(self, 
                          current_joint_pos: JointPos,
@@ -69,6 +76,7 @@ class RobotBase(abc.ABC):
         pass
 
 
+    # 约定：先求目标关节解再生成点到点路径，返回沿途位姿序列。
     @abc.abstractmethod
     def move_to_pose(self,
                      target_pose: Pose,
@@ -81,6 +89,7 @@ class RobotBase(abc.ABC):
         pass
 
 
+    # 返回模型关节数量。
     def get_dof(self) -> int:
         """
         获取机器人自由度(关节数)
@@ -89,6 +98,7 @@ class RobotBase(abc.ABC):
         return self._degree_of_freedom
     
 
+    # 返回构造时指定的型号名称。
     def get_model_name(self) -> str:
         """
         获取机器人型号名称

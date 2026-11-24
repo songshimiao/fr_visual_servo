@@ -1,3 +1,6 @@
+# 阅读主线：参数/标定 → 视觉线程存 cam_T_marker → 主循环读关节做 FK → 悬停目标 → PBVS 微步/IK → ServoJ。
+# 注意下面旧版总述与当前实现有差异：当前共享状态仍存相机系位姿，基座系融合实际发生在控制循环。
+# 默认 dry-run 仍连接控制器读取状态；只有 --execute 且终端确认后才执行运动。
 """
 scripts/main_pbvs.py
  
@@ -96,40 +99,48 @@ USER_ID = 0
 SERVO_TOOL_ID = 0
 
 
+# 把 numpy 4×4 矩阵包装为 spatialmath.SE3；check=False 跳过构造检查，不代表数据已验证。
 def np_to_SE3(T: np.ndarray) -> SE3:
     return SE3(T, check=False)
 
 
+# 线程间传递最近检测、单调时间戳和可见标志；本实现传的是相机系 cam_T_marker。
 class SharedMarkerState:
     """相机线程与控制线程之间共享的 marker 观测状态, 用线程锁保护"""
 
+    # 初始化空观测与互斥锁；视觉与控制线程通过以下三个方法访问。
     def __init__(self):
         self._lock = threading.Lock()
         self.cam_T_marker: Optional[SE3] = None
         self.timestamp: float = 0.0
         self.found: bool = False
 
+    # 在同一锁内更新位姿、时间和 found，保证读取不会拿到混合帧状态。
     def update(self, cam_T_marker: SE3, t: float):
         with self._lock:
             self.cam_T_marker = cam_T_marker
             self.timestamp = t
             self.found = True
 
+    # 只撤销可见性，保留历史位姿供诊断；控制循环必须同时判断 found 和年龄。
     def mark_not_found(self):
         with self._lock:
             self.found = False
 
+    # 返回同一时刻的（位姿、时间戳、是否检测到），避免多次分开读取。
     def read(self):
         with self._lock:
             return self.cam_T_marker, self.timestamp, self.found
 
 
+# 仅主相机用于 PBVS 检测；另一台在 WebPreview 中作为独立监控流，不参与双路目标接管。
 class VisionWorker(threading.Thread):
     """
     相机检测线程: 持续抓取所选相机彩色帧, 检测 ArUco marker, 更新共享状态,
     并发布网页预览(网页结束按钮或 q 键触发全局停止)。
     """
 
+    # 保存内参、目标 ID、相机配置和共享状态；prev_marker_poses 作为下一帧候选选择参考。
     def __init__(self, camera_matrix, dist_coeffs, marker_length: float, dict_name: str,
                  marker_id: Optional[int], shared_state: SharedMarkerState,
                  stop_event: threading.Event, preview: WebPreview, status_text_fn=None,
@@ -150,6 +161,7 @@ class VisionWorker(threading.Thread):
         # 保存上一帧的marker姿态，用于多解消除
         self.prev_marker_poses: Optional[List[np.ndarray]] = None
 
+    # 负责预览/相机生命周期，任意启动或检测异常均置 stop_event 通知控制循环退出。
     def run(self):
         try:
             with self.preview:
@@ -159,6 +171,7 @@ class VisionWorker(threading.Thread):
             # Also stop the control loop if camera/server startup or detection fails.
             self.stop_event.set()
 
+    # 抓图、选 ID、求相机系位姿并更新共享状态，叠加控制文字后异步提交网页预览。
     def _run_detection(self):
         print("[视觉线程] 启动, 在网页中结束程序，或在终端按 Ctrl+C")
         try:
@@ -202,6 +215,7 @@ class VisionWorker(threading.Thread):
             print("[视觉线程] 已停止")
 
 
+# 按兼容签名尝试 ServoJ；这里只捕获参数签名 TypeError，返回码交给调用者。
 def _try_servo_j(rpc_robot, joint_deg_target: list, vel_percent: float):
     """
     调用 Fairino SDK 的 ServoJ 接口下发关节空间伺服目标。
@@ -222,6 +236,7 @@ def _try_servo_j(rpc_robot, joint_deg_target: list, vel_percent: float):
     return rpc_robot.ServoJ(joint_deg_target)
 
 
+# 配置滤波/静止检测/悬停状态机，等待首次目标后进入高频控制；finally 负责结束会话。
 def main():
     parser = argparse.ArgumentParser(description="PBVS 实时视觉伺服跟随 + 静止后靠近")
     add_web_arguments(parser)
@@ -327,6 +342,7 @@ def main():
     kinematics_model = FairinoRobot(model_name=args.robot_model)
     print("[connect] 连接成功")
 
+    # 控制器反馈以度为单位，此处统一转为模型所用弧度；读失败立即抛异常。
     def get_q_rad() -> np.ndarray:
         err, joint_deg = rpc_robot.GetActualJointPosDegree()
         if err != 0:
@@ -384,6 +400,7 @@ def main():
                       "pos_std_mm": 0.0, "ang_std_deg": 0.0, "joint_limit_msg": ""}
     joint_limit_margin_rad = np.deg2rad(args.joint_limit_margin_deg)
 
+    # 把控制状态转为视觉预览文字，!! 前缀在画面中显示红色告警。
     def status_text_fn():
         lines = [
             f"state: {control_status['state']}",
@@ -471,6 +488,8 @@ def main():
                 base_T_flange_current = kinematics_model.forward_kinematics(
                     q_current)
                 base_T_cam_current = base_T_flange_current * flange_T_cam
+                # 实际融合位置在这里：用本拍关节 FK 与最近相机观测组合，并非按图像时刻缓存的历史 TF。
+                # 因此不要把顶部旧版说明中的“检测瞬间融合”当作当前实现行为。
                 base_T_marker_raw = base_T_cam_current * cam_T_marker_raw
                 base_T_marker = marker_filter.update(base_T_marker_raw)
 
@@ -600,6 +619,7 @@ def main():
         if args.execute:
             try:
                 rpc_robot.ServoMoveEnd()
+                # 执行模式退出时还会按原逻辑发 MoveJ 回位；网页 q/结束也会走到这里，不是硬件急停。
                 rpc_robot.MoveJ([90, -90, 90, -90, -90, 0], tool=0, user=0)
             except AttributeError:
                 pass

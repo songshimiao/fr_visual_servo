@@ -1,3 +1,5 @@
+# 基于 Robotics Toolbox 的模型与轨迹规划，不直接连接控制器或发送运动。
+# MDH 表 → RevoluteMDH 链 → FK/LM-IK；关节量为 rad，速度 rad/s，加速度 rad/s²。
 import numpy as np
 from typing import Optional, List
 import roboticstoolbox as rtb
@@ -5,6 +7,7 @@ from .robot_base import RobotBase, JointPos, Pose, JointLimit, JointTrajectory, 
 from .fairino_dh_params import get_mdh_params, get_supported_models, DEFAULT_QLIM_RAD, FR3_C_QLIM_RAD
 
 
+# 旧工程通用 Fairino 模型；与 ROS 工程的轻量数值模型是两种独立实现。
 class FairinoRobot(RobotBase):
     """
     Fairino 机器人实现类, 基于 Robotics Toolbox for Python (RTB) 实现
@@ -12,6 +15,7 @@ class FairinoRobot(RobotBase):
     型号与 MDH 参数的对应关系维护在 fairino_dh_params.py 中
     """
 
+    # 按型号装配六轴 MDH 连杆与关节限位，初始化内部参考关节角为零。
     def __init__(self, model_name: str = "FR5", joint_limits: Optional[List[JointLimit]] = None):
         """
         :param model_name: Fairino 型号名称, 大小写不敏感, 完整支持列表见 fairino_dh_params.get_supported_models()
@@ -51,6 +55,7 @@ class FairinoRobot(RobotBase):
     # 工具方法
     # -------------
 
+    # 查询参数表已有型号。
     @staticmethod
     def list_supported_models() -> List[str]:
         """
@@ -59,6 +64,7 @@ class FairinoRobot(RobotBase):
         """
         return get_supported_models()
 
+    # 返回每轴 [min,max] 弧度数组，供入口下发前检查。
     def get_joint_limits(self) -> List[JointLimit]:
         """
         获取当前机器人关节限位
@@ -66,6 +72,7 @@ class FairinoRobot(RobotBase):
         """
         return self._joint_limits
 
+    # 在每轴限位内收 margin_rad 后逐项检查，返回是否通过及超限轴明细。
     def check_joint_limits(self, joint_pos: JointPos, margin_rad: float = 0.0):
         """
         检查给定关节位置是否超出(或过于接近)关节限位。
@@ -98,6 +105,7 @@ class FairinoRobot(RobotBase):
     # 运动学方法
     # -------------
 
+    # 调用模型 fkine，返回 base_T_flange；不读取硬件状态。
     def forward_kinematics(self, joint_pos: JointPos) -> Pose:
         """
         计算正运动学, 根据关节位置计算末端位姿
@@ -108,6 +116,7 @@ class FairinoRobot(RobotBase):
         pose = self._robot.fkine(q)
         return pose
 
+    # 以参考角为 LM 初值，失败返回 None；成功解仍需要上层显式检查关节限位。
     def inverse_kinematics(self, target_pose: Pose,
                            reference_joint_pos: Optional[JointPos] = None) -> Optional[JointPos]:
         """
@@ -129,6 +138,8 @@ class FairinoRobot(RobotBase):
     # 运动规划
     # ------------
 
+    # 先求所有轴可满足的共同总时长，再按各轴峰值速度生成同步三角/梯形轨迹。
+    # 返回采样位置列表，不包含 SDK 执行或控制器反馈校正。
     def move_joint_space(self,
                          current_joint_pos: JointPos,
                          target_joint_pos: JointPos,
@@ -238,6 +249,7 @@ class FairinoRobot(RobotBase):
         # 4. 返回结果
         return list(full_trajectory_np)
 
+    # 由起始参考角求 IK 与关节轨迹，再逐点 FK，得到对应的法兰位姿路径。
     def move_to_pose(self,
                      target_pose: Pose,
                      reference_joint_pos: Optional[JointPos] = None) -> Optional[PoseTrajectory]:

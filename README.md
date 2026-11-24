@@ -2,6 +2,27 @@
 
 这是一个基于位置的视觉伺服（PBVS）系统，用于控制 Fairino FR5 机器人实时跟随 ArUco 标记板进行视觉引导操作。
 
+## 源码阅读顺序
+
+各模块、类、函数和测试已补充中文注释；已有详细中文说明保留。
+先理解坐标系与控制算法，再追踪硬件入口，建议按下表阅读。
+
+| 顺序 | 文件 | 阅读重点 |
+|------|------|----------|
+| 1 | [`robot_base.py`](scripts/robot/robot_base.py)、[`fairino_dh_params.py`](scripts/robot/fairino_dh_params.py)、[`fairino_robot.py`](scripts/robot/fairino_robot.py) | 米/弧度约定、MDH、FK/IK、纯模型轨迹规划 |
+| 2 | [`camera_stream.py`](scripts/algorithm/camera_stream.py)、[`aruco_detector.py`](scripts/algorithm/aruco_detector.py) | 相机选择、BGR 数据、内参隔离、`camera_T_marker` |
+| 3 | [`camera_calibration.py`](scripts/algorithm/camera_calibration.py) | ChArUco、EIH/ETH 安装关系与矩阵方向 |
+| 4 | [`Pbvs.py`](scripts/algorithm/Pbvs.py) | 单拍位姿控制、IK、悬停、滤波、静止检测与远近状态机 |
+| 5 | [`main_pbvs.py`](scripts/main_pbvs.py) | 视觉共享状态、控制主循环、目标计算、ServoJ、退出回位 |
+| 6 | [`web_preview.py`](scripts/algorithm/web_preview.py)、[`camera_preview.py`](scripts/camera_preview.py) | 后台 JPEG/MJPEG、多通道采样事件与资源清理 |
+| 7 | [`visual_servo_hover_test.py`](scripts/visual_servo_hover_test.py)、[`fr5_hardware_test.py`](scripts/fr5_hardware_test.py)、[`fr5_accuracy_test.py`](scripts/fr5_accuracy_test.py)、[`tests/`](tests/) | 一次性悬停、现场诊断与无硬件回归的区别 |
+
+阅读旧代码时特别留意新增的实现说明：当前 `main_pbvs.py` 共享的是相机系观测，
+基座系融合发生在控制循环；旧 PnP 候选循环重复调用同一种单解方法，并不保证枚举不同解；
+旧手眼字段名及 `transform_pose` 的 ETH 求逆与求解输出方向存在不一致，注释已明确标出，
+此次未改变算法行为。它们不能直接按同级 ROS 工程的新坐标轴约定理解。
+厂家 SDK 位于被 Git 忽略的 `scripts/robot/fairino/`，保持原样；项目调用处已注明度/弧度转换。
+
 ## 系统概述
 
 本项目默认使用 Orbbec 双相机：Gemini 305 为 eye-in-hand（眼在手上），Gemini 335 为 eye-to-hand（眼在手外），并保留 RealSense 单相机兼容入口。能够：

@@ -1,3 +1,5 @@
+# 机器人几何参数表：每个型号按六个关节次序给出改进 DH 参数。
+# 长度存储为米、角度为弧度；FR5 参数被 FK/IK 使用，限位表与几何参数分开定义。
 """
 Fairino (FR) 系列协作机器人 MDH (Modified/Craig Denavit-Hartenberg) 参数表
 数据来源: https://fairino-doc-zhs.readthedocs.io/latest/CobotsManual/robot_brief_introduction.html
@@ -14,6 +16,7 @@ import numpy as np
 from typing import Dict, List, NamedTuple
 
 
+# 单关节的具名参数记录；theta_offset 是零位偏置，不是运行时反馈关节角。
 class MDHParam(NamedTuple):
     """
     单个关节的 Modified DH 参数
@@ -28,6 +31,7 @@ PI = np.pi
 HALF_PI = np.pi / 2.0
 
 
+# 表中长度以 mm 填写，通过此处除以 1000 后统一供米制运动学使用。
 def _mm(v: float) -> float:
     """
     将毫米(mm)单位转换为米(m)单位
@@ -179,6 +183,7 @@ FR3_C_QLIM_DEG = [
 FR3_C_QLIM_RAD = [(np.deg2rad(qmin), np.deg2rad(qmax)) for qmin, qmax in FR3_C_QLIM_DEG]
 
 
+# 返回可用型号名，供入口校验或错误提示。
 def get_supported_models() -> List[str]:
     """
     获取当前已收录 MDH 参数的 Fairino 机器人型号列表
@@ -187,6 +192,7 @@ def get_supported_models() -> List[str]:
     return list(FAIRINO_MDH_PARAMS.keys())
 
 
+# 规范化型号字符串后查询；未收录型号抛错，不自动套用其他机器人尺寸。
 def get_mdh_params(model_name: str) -> List[MDHParam]:
     """
     按型号名称获取 MDH 参数

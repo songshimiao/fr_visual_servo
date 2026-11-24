@@ -1,3 +1,4 @@
+# 无硬件相机回归：SDK 均用 Mock 替换，验证参数解析、标定隔离、像素格式和资源清理。
 """No camera/robot required: selection, calibration guards, pixel conversion and SDK lifecycle."""
 import argparse
 import contextlib
@@ -22,7 +23,9 @@ FORMATS = types.SimpleNamespace(**{v: v for v in
     ("BGR", "RGB", "MJPG", "YUYV", "UYVY", "NV12", "NV21", "I420")})
 
 
+# 共享假 SDK 与帧构造器；各 test 方法说明采集层应保持的行为。
 class CameraTests(unittest.TestCase):
+    # 创建最小命令行解析器，复用生产相机参数声明。
     def args(self, argv=()):
         parser = argparse.ArgumentParser()
         add_camera_arguments(parser)
@@ -30,6 +33,7 @@ class CameraTests(unittest.TestCase):
         parser.add_argument("--hand-eye", default=None)
         return parser.parse_args(argv)
 
+    # 保留终端选择兼容入口，选择 Orbbec 后使用独立 305 标定路径。
     def test_terminal_selection_and_separate_paths(self):
         args = self.args()
         args.camera = None  # Legacy interactive API remains available.
@@ -41,6 +45,7 @@ class CameraTests(unittest.TestCase):
         self.assertIn("_orbbec_gemini305.json", args.intrinsics)
         self.assertIn("_orbbec_gemini305.json", args.hand_eye)
 
+    # 默认主 305/副 335；ETH 模式选 335，单相机开关关闭配对。
     def test_default_pair_and_eye_to_hand_paths(self):
         args = self.args()
         settings = resolve_camera_arguments(args)
@@ -56,6 +61,7 @@ class CameraTests(unittest.TestCase):
         args.single_camera = True
         self.assertIsNone(paired_camera_settings(args))
 
+    # 拒绝另一型号或物理安装方式不符的标定文件。
     def test_reject_other_orbbec_model_and_mount(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "calibration.json"
@@ -68,6 +74,7 @@ class CameraTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "安装方式"):
                 validate_calibration(path, CameraSettings("orbbec", model="gemini335"))
 
+    # USB 枚举顺序反转时仍按型号选择 335。
     def test_335_is_selected_by_model_even_when_305_is_first(self):
         ob, _ = self.sdk()
         device305 = ob.Context.return_value.query_devices.return_value.get_device_by_index.return_value
@@ -88,6 +95,7 @@ class CameraTests(unittest.TestCase):
             finally:
                 stream.stop()
 
+    # 显式内参路径不被默认值覆盖，独立检测允许不加载手眼。
     def test_optional_hand_eye_and_explicit_paths(self):
         args = self.args(["--camera", "orbbec", "--intrinsics", "custom.json"])
         args.optional_hand_eye = True
@@ -96,9 +104,11 @@ class CameraTests(unittest.TestCase):
         self.assertEqual(args.intrinsics, "custom.json")
         self.assertIsNone(args.hand_eye)
 
+    # 检查旧 RealSense 兼容，以及新 Orbbec 的元数据、序列号、尺寸和后端隔离。
     def test_calibration_guards(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "calibration.json"
+            # 把本轮构造的 JSON 写到临时文件，供生产校验函数读取。
             def save(data):
                 path.write_text(json.dumps(data))
             save({"image_size": [640, 480]})
@@ -116,10 +126,12 @@ class CameraTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "类型"):
                 validate_calibration(path, CameraSettings())
 
+    # 构造只实现数据/格式/尺寸方法的 SDK 帧替身。
     def frame(self, data, fmt, width=4, height=2):
         return types.SimpleNamespace(get_data=lambda: data, get_format=lambda: fmt,
                                      get_width=lambda: width, get_height=lambda: height)
 
+    # 验证 RGB/BGR 通道顺序、输出不共享 SDK 缓冲，以及 MJPEG 错误/尺寸检查。
     def test_color_order_ownership_and_mjpeg(self):
         bgr = np.full((2, 4, 3), (15, 90, 200), np.uint8)
         for fmt, data in (("BGR", bgr), ("RGB", bgr[:, :, ::-1].copy())):
@@ -135,6 +147,7 @@ class CameraTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "尺寸"):
             orbbec_frame_to_bgr(self.frame(jpg, "MJPG", width=8), FORMATS)
 
+    # 用中性色度黑图检查五种 YUV 布局都转成 BGR 黑图。
     def test_yuv_formats(self):
         # Neutral chroma, studio-range black -> BGR black in every supported layout.
         for fmt in ("YUYV", "UYVY", "NV12", "NV21", "I420"):
@@ -147,6 +160,7 @@ class CameraTests(unittest.TestCase):
             np.testing.assert_array_equal(orbbec_frame_to_bgr(self.frame(raw, fmt), FORMATS),
                                           np.zeros((2, 4, 3), np.uint8))
 
+    # 构造一台假 305、一个精确流配置和管线生命周期方法，不导入实体 SDK。
     def sdk(self):
         info = Mock()
         info.get_name.return_value = "Orbbec Gemini 305"
@@ -172,6 +186,7 @@ class CameraTests(unittest.TestCase):
         ob.Context.return_value.query_devices.return_value = devices
         return ob, pipeline
 
+    # 无帧超时抛错，重复 stop 幂等，不支持分辨率不静默替换。
     def test_exact_profile_timeout_and_stop(self):
         ob, pipeline = self.sdk()
         with patch.dict(sys.modules, pyorbbecsdk=ob), contextlib.redirect_stdout(io.StringIO()):
@@ -187,6 +202,7 @@ class CameraTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "可用彩色流"):
                 OrbbecColorStream(width=1280)
 
+    # 连接后发现标定序列号不符，必须关闭已打开管线。
     def test_factory_stops_camera_on_serial_mismatch(self):
         ob, pipeline = self.sdk()
         with tempfile.TemporaryDirectory() as tmp:
@@ -197,6 +213,7 @@ class CameraTests(unittest.TestCase):
                     create_camera(CameraSettings("orbbec"), [path])
             pipeline.stop.assert_called_once()
 
+    # SDK 畸变字段必须按 OpenCV rational 顺序导出，并保存 K/尺寸/出厂来源。
     def test_factory_intrinsics_use_opencv_rational_order(self):
         ob, _ = self.sdk()
         profile = ob.Pipeline.return_value.get_stream_profile_list.return_value.get_stream_profile_by_index.return_value

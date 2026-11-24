@@ -1,3 +1,5 @@
+# 旧工程无头预览：相机生产线程 → 最新原图槽 → JPEG 编码线程 → MJPEG HTTP 客户端。
+# 每通道独立 sample 事件，quit 共用 stop_event；HTTP 只传事件，不直接执行机械臂指令。
 """Headless MJPEG preview. HTTP and JPEG encoding never run in the servo loop."""
 
 import argparse
@@ -12,6 +14,7 @@ from urllib.parse import urlsplit
 import cv2
 
 
+# 统一注册监听地址、端口、帧率、JPEG 质量和禁用网页参数。
 def add_web_arguments(parser):
     parser.add_argument("--web-host", default="0.0.0.0", help="网页监听地址，默认所有网卡")
     parser.add_argument("--web-port", type=int, default=8080, help="网页端口，默认8080")
@@ -20,6 +23,7 @@ def add_web_arguments(parser):
     parser.add_argument("--no-web", action="store_true", help="关闭网页，仅保留终端输出")
 
 
+# 慢客户端只读取最新 JPEG，不让待发图像队列持续增长。
 class WebPreview:
     """One raw-frame slot and one JPEG slot; slow clients cannot queue frames.
 
@@ -28,6 +32,7 @@ class WebPreview:
     The HTTP API never sends robot commands or enables robot execution.
     """
 
+    # 校验配置，创建通道缓存、条件变量、采样/停止事件及请求令牌，尚未绑定端口。
     def __init__(self, host="0.0.0.0", port=8080, fps=10.0, quality=80,
                  title="Camera preview", allow_capture=False, stop_event=None,
                  enabled=True):
@@ -57,6 +62,7 @@ class WebPreview:
         self._token = secrets.token_urlsafe(24)
         self._server = self._http_thread = self._encoder_thread = None
 
+    # 从入口参数创建预览；Orbbec 双路时增加副通道，监控模式另开副相机读取线程。
     @classmethod
     def from_args(cls, args, **kwargs):
         preview = cls(host=args.web_host, port=args.web_port, fps=args.web_fps,
@@ -76,6 +82,7 @@ class WebPreview:
                     preview._secondary_settings = settings
         return preview
 
+    # 创建共享停止事件但拥有独立帧缓存/保存事件的通道。
     def add_channel(self, name, title):
         if name in self.channels:
             raise ValueError(f"Duplicate preview channel: {name}")
@@ -85,12 +92,14 @@ class WebPreview:
         self.channels[name] = channel
         return channel
 
+    # 在条件锁内更新该通道保存进度和提示，供 /status 展示。
     def set_feedback(self, *, saved=None, target=None, message=None):
         with self._condition:
             for key, value in (("saved", saved), ("target", target), ("message", message)):
                 if value is not None:
                     self._feedback[key] = value
 
+    # 监控入口独占副相机读取；异常记录通道错误并停止全局，finally 关闭副流。
     def _monitor_secondary(self):
         if __package__:
             from .camera_stream import create_camera
@@ -113,12 +122,15 @@ class WebPreview:
             if stream is not None:
                 stream.stop()
 
+    # 上下文进入时启动服务器与编码线程。
     def __enter__(self):
         return self.start()
 
+    # 离开上下文时统一释放端口、线程和通道。
     def __exit__(self, *_):
         self.close()
 
+    # 绑定 HTTP 端口，每通道启动编码器，必要时启动副相机监控。
     def start(self):
         if self._server is not None or not self.enabled:
             return self
@@ -138,6 +150,7 @@ class WebPreview:
         print(f"[网页预览] http://{address}:{self.port}/  ({self.title})")
         return self
 
+    # 按网页帧率节流复制图像，只覆盖最新槽并唤醒编码器，不等待编码或客户端发送。
     def publish(self, frame):
         if not self.enabled or self._closed.is_set():
             return
@@ -151,6 +164,7 @@ class WebPreview:
             self._raw = (snapshot, now)
             self._condition.notify_all()
 
+    # 将线程事件转换成旧交互循环的 q/s；quit 锁存，sample 读取后清除。
     def poll_key(self):
         if self.stop_event.is_set():
             return ord("q")
@@ -159,6 +173,7 @@ class WebPreview:
             return ord("s")
         return -1
 
+    # 在锁外编码最新原图，成功后原子更新 JPEG/序号；编码失败记录错误并允许后续恢复。
     def _encode_loop(self):
         while not self._closed.is_set():
             with self._condition:
@@ -184,6 +199,7 @@ class WebPreview:
                 self._error = None
                 self._condition.notify_all()
 
+    # 返回帧龄、错误、停止状态及采样计数；这些是显示状态，不是运动控制状态。
     def status(self):
         with self._condition:
             return {"title": self.title, "frame_sequence": self._sequence,
@@ -192,6 +208,7 @@ class WebPreview:
                     "stopping": self.stop_event.is_set(), "error": self._error,
                     "capture_enabled": self.allow_capture, **self._feedback}
 
+    # 生成内嵌 HTML/CSS/JS：多路 MJPEG、状态轮询、保存/退出按钮和键盘事件。
     def _page(self):
         panels = []
         for name, channel in self.channels.items():
@@ -235,17 +252,22 @@ document.addEventListener('keydown',e=>{if(e.repeat||/INPUT|TEXTAREA/.test(e.tar
                 .replace("__CHANNELS__", json.dumps(list(self.channels)))
                 .replace("__ALLOW_CAPTURE__", json.dumps(self.allow_capture))).encode("utf-8")
 
+    # 闭包捕获当前 preview，生成对应 HTTP Handler 类。
     def _handler(self):
         preview = self
 
+        # 每个连接独立处理，访问共享缓存时使用相应通道的条件锁。
         class Handler(BaseHTTPRequestHandler):
+            # 设置连接超时，防止慢客户端永久占用处理线程。
             def setup(self):
                 super().setup()
                 self.connection.settimeout(3.0)
 
+            # 静默常规 HTTP 日志，避免视频流与状态轮询刷屏。
             def log_message(self, *_):
                 pass
 
+            # 统一发送普通响应，浏览器中断连接时只关闭本连接。
             def reply(self, code, data, content_type="application/json; charset=utf-8"):
                 try:
                     self.send_response(code)
@@ -260,6 +282,7 @@ document.addEventListener('keydown',e=>{if(e.repeat||/INPUT|TEXTAREA/.test(e.tar
                     # Browsers may cancel status/page requests while the SDK starts.
                     self.close_connection = True
 
+            # 提供页面、状态和指定通道 MJPEG；按 JPEG 序号等新帧，socket 写入在锁外进行。
             def do_GET(self):
                 path = urlsplit(self.path).path
                 if path == "/":
@@ -298,6 +321,7 @@ document.addEventListener('keydown',e=>{if(e.repeat||/INPUT|TEXTAREA/.test(e.tar
                 else:
                     self.reply(404, b'{"error":"not found"}')
 
+            # 校验令牌，仅接受 quit 或允许采集通道的 sample，再置对应事件。
             def do_POST(self):
                 # A per-process token prevents cross-origin forms from issuing commands.
                 if self.headers.get("X-Preview-Token") != preview._token:
@@ -320,6 +344,7 @@ document.addEventListener('keydown',e=>{if(e.repeat||/INPUT|TEXTAREA/.test(e.tar
 
         return Handler
 
+    # 通知退出并唤醒等待者，关闭服务器，递归关闭副通道，等待自有线程结束。
     def close(self):
         self._closed.set()
         self.stop_event.set()
@@ -336,6 +361,7 @@ document.addEventListener('keydown',e=>{if(e.repeat||/INPUT|TEXTAREA/.test(e.tar
                 thread.join(timeout=3.0)
 
 
+# 生成带计时文字的合成黑图，用于无相机/无机械臂的 HTTP 和 JPEG 自检。
 def main():
     """Synthetic camera feed for testing HTTP/JPEG without RealSense or a robot."""
     import numpy as np

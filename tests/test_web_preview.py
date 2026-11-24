@@ -1,3 +1,6 @@
+# 测试中的 reference 回调用来分别模拟检出、失败与网页退出。
+# 无头网页回归：本地 HTTP/JPEG 使用合成帧，硬件依赖由隔离函数或替身代替。
+# 重点验证最新帧缓存不阻塞采集、各通道保存事件隔离、退出清理，以及 dry-run 不运动。
 """Offline tests: real HTTP/JPEG, synthetic frames, and isolated camera call sites.
 
 Run from the repository root: python3 -m unittest discover -s tests -v
@@ -27,6 +30,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from algorithm.web_preview import WebPreview  # noqa: F401
 
 
+# 带截止时间轮询异步条件，避免测试无限等待后台线程。
 def wait_until(predicate, timeout=3.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -36,6 +40,7 @@ def wait_until(predicate, timeout=3.0):
     raise AssertionError("Timed out waiting for preview")
 
 
+# 从生产源码提取指定函数定义，注入测试全局变量运行，避免导入相机/机器人依赖。
 def isolated_definition(path, name, namespace):
     """Exercise the actual function without importing camera/robot dependencies."""
     tree = ast.parse((ROOT / path).read_text())
@@ -46,14 +51,18 @@ def isolated_definition(path, name, namespace):
     return namespace[name]
 
 
+# 真实本机 HTTP 与后台编码线程测试，每例结束都清理服务器。
 class PreviewTests(unittest.TestCase):
+    # 为每个用例准备需要清理的预览实例列表。
     def setUp(self):
         self.preview = WebPreview(host="127.0.0.1", port=0, fps=60,
                                   allow_capture=True, title="Test <camera>").start()
 
+    # 关闭本用例创建的预览，释放线程和监听端口。
     def tearDown(self):
         self.preview.close()
 
+    # 发送本地 HTTP 测试请求，必要时附预览令牌并读取响应。
     def request(self, path, method="GET", token=True):
         conn = http.client.HTTPConnection("127.0.0.1", self.preview.port, timeout=3)
         headers = {"X-Preview-Token": self.preview._token} if token else {}
@@ -63,6 +72,7 @@ class PreviewTests(unittest.TestCase):
         conn.close()
         return result
 
+    # 验证页面、状态 JSON 和能实际解码的 MJPEG 内容。
     def test_page_status_and_real_jpeg(self):
         code, page = self.request("/")
         self.assertEqual(code, 200)
@@ -88,6 +98,7 @@ class PreviewTests(unittest.TestCase):
             conn.close()
         self.assertFalse(self.preview.stop_event.is_set())
 
+    # 两个真实 HTTP 通道的图像与采样事件相互独立。
     def test_two_real_streams_and_independent_save_requests(self):
         self.preview.close()
         self.preview = WebPreview(host="127.0.0.1", port=0, fps=60, allow_capture=True)
@@ -134,6 +145,7 @@ class PreviewTests(unittest.TestCase):
         self.request("/command/quit", "POST")
         self.assertEqual(secondary.poll_key(), ord("q"))
 
+    # 错误令牌/未知动作被拒绝，quit 事件触发后保持停止状态。
     def test_command_guards_and_latched_quit(self):
         self.assertEqual(self.request("/command/quit")[0], 404)
         self.assertEqual(self.request("/command/quit", "POST", token=False)[0], 403)
@@ -145,15 +157,18 @@ class PreviewTests(unittest.TestCase):
         self.assertEqual(self.preview.poll_key(), ord("q"))
         self.assertEqual(self.preview.poll_key(), ord("q"))
 
+    # 纯监控模式没有采样能力，伪造保存请求也不能生效。
     def test_sample_is_disabled_for_monitor_only(self):
         self.preview.allow_capture = False
         self.assertEqual(self.request("/command/sample", "POST")[0], 404)
         self.assertEqual(self.request("/command/execute", "POST")[0], 404)
 
+    # 编码器被故意阻塞时 publish 仍快速返回，并仅保留最新待编码图。
     def test_publish_is_not_blocked_by_encoder_and_keeps_latest(self):
         started, release = threading.Event(), threading.Event()
         real_encode = cv2.imencode
 
+        # 用事件控制的慢编码替身，精确制造生产者与编码器竞争。
         def slow_encode(*args):
             started.set()
             release.wait(3)
@@ -175,6 +190,7 @@ class PreviewTests(unittest.TestCase):
                 release.set()
             wait_until(lambda: self.preview.status()["frame_sequence"] == 2)
 
+    # 一次编码失败应显示错误，后续成功帧可恢复，不永久退出编码线程。
     def test_encoding_failure_is_reported_and_recovers(self):
         frame = np.zeros((32, 32, 3), dtype=np.uint8)
         with patch("algorithm.web_preview.cv2.imencode", return_value=(False, None)):
@@ -185,6 +201,7 @@ class PreviewTests(unittest.TestCase):
         wait_until(lambda: self.preview.status()["frame_sequence"] == 1)
         self.assertIsNone(self.preview.status()["error"])
 
+    # close 后线程停止，原监听端口可重新使用。
     def test_close_releases_workers_and_port(self):
         port = self.preview.port
         self.preview.close()
@@ -194,14 +211,19 @@ class PreviewTests(unittest.TestCase):
             pass
 
 
+# 隔离执行相机入口的真实函数，使用替身检查无头集成和运动分支。
 class CameraIntegrationTests(unittest.TestCase):
+    # dry-run、终端取消、检测失败都不能调用使能或运动。
     def test_hover_dry_run_cancel_and_detection_failure_never_move(self):
+        # 最小位姿替身，只提供悬停入口所需乘法/位置/姿态接口。
         class Pose:
             t = np.zeros(3)
 
+            # 测试不计算几何，只维持可组合的位姿接口。
             def __mul__(self, other):
                 return self
 
+            # 返回固定欧拉角以满足入口打印格式，不代表实际姿态。
             def rpy(self, **kwargs):
                 return np.zeros(3)
 
@@ -216,6 +238,7 @@ class CameraIntegrationTests(unittest.TestCase):
                 stream.get_frame.return_value = None
                 preview = WebPreview(enabled=False)
 
+                # 按场景返回假参考位姿、抛检测失败异常或先置退出事件，验证后续不发生运动。
                 def reference(*args, **kwargs):
                     if scenario == "detection-failure":
                         raise RuntimeError("no marker")
@@ -259,6 +282,7 @@ class CameraIntegrationTests(unittest.TestCase):
                 rpc.MoveJ.assert_not_called()
                 stream.stop.assert_called_once()
 
+    # 为被提取的生产函数注入相机、预览、OpenCV 等替身环境。
     def environment(self):
         frame = np.zeros((24, 32, 3), np.uint8)
         camera = types.SimpleNamespace(get_color_frame=lambda: frame)
@@ -271,6 +295,7 @@ class CameraIntegrationTests(unittest.TestCase):
                "estimate_target_pose_in_camera": lambda *_: np.eye(4)}
         return camera, env
 
+    # 网页 sample 事件实际进入内参/手眼采样分支，并增加对应样本数。
     def test_web_sample_collects_intrinsics_and_hand_eye(self):
         camera, env = self.environment()
         intrinsic = isolated_definition("scripts/algorithm/camera_calibration.py",
@@ -289,6 +314,7 @@ class CameraIntegrationTests(unittest.TestCase):
                                   preview=preview)
                 self.assertEqual([len(v) for v in result], [1, 1, 1, 1])
 
+    # 若已请求退出，采集循环不得继续读取相机。
     def test_quit_before_camera_read(self):
         camera, env = self.environment()
         camera.get_color_frame = Mock(side_effect=AssertionError("camera must not be read"))
@@ -300,6 +326,7 @@ class CameraIntegrationTests(unittest.TestCase):
                 result = intrinsic(camera, None, None, 20, preview=preview)
             self.assertEqual(result, ([], [], None))
 
+    # 视觉相机异常时关闭预览并通知主控制循环退出。
     def test_vision_camera_failure_closes_preview_and_signals_stop(self):
         preview = WebPreview(host="127.0.0.1", port=0)
         env = {"threading": threading,
@@ -312,6 +339,7 @@ class CameraIntegrationTests(unittest.TestCase):
         self.assertTrue(stop.is_set())
         self.assertFalse(preview._http_thread.is_alive())
 
+    # 检查入口未残留 imshow/waitKey 等依赖本地显示器的调用。
     def test_no_highgui_calls_remain(self):
         for path in (ROOT / "scripts").rglob("*.py"):
             if "fairino" in path.parts:
@@ -322,6 +350,7 @@ class CameraIntegrationTests(unittest.TestCase):
                     self.assertNotIn(node.func.attr, {"imshow", "waitKey", "destroyAllWindows"},
                                      f"HighGUI call in {path}:{node.lineno}")
 
+    # 禁用预览时不启动 HTTP/编码，非法端口/帧率/质量会被拒绝。
     def test_disabled_preview_and_argument_validation(self):
         with WebPreview(enabled=False) as preview:
             self.assertIsNone(preview._server)
